@@ -1,0 +1,15 @@
+# Entornos virtuales
+env/
+venv/
+
+# Datos
+/Data
+
+# Archivos temporales de Jupyter y Python
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Configuración de VS Code
+.vscode/
