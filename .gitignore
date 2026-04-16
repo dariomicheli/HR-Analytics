@@ -2,8 +2,11 @@
 env/
 venv/
 
-# Datos
-/Data
+# Ignorar todo el contenido de Data
+Data/*
+
+# Excepto el archivo .gitkeep
+!Data/.gitkeep
 
 # Archivos temporales de Jupyter y Python
 __pycache__/
