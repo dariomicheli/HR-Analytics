@@ -1,3 +1,6 @@
+# Chicos veamos despues que versiones usamos de cada
 pandas
 matplotlib
 notebook
+ydata-profiling
+seaborn
