@@ -1,7 +1,7 @@
 # Entornos virtuales
 env/
 venv/
-
+venv311/
 # Ignorar todo el contenido de Data
 Data/*
 

@@ -1,6 +1,14 @@
-# Chicos veamos despues que versiones usamos de cada
+# Librerías base (definir versiones después)
+numpy
 pandas
+
+# Visualización
 matplotlib
-notebook
-ydata-profiling
 seaborn
+plotly
+
+# Notebooks
+notebook
+
+# EDA automático
+ydata-profiling
