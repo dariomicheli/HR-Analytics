@@ -1,0 +1,62 @@
+Table EMPLEADO [headercolor: #175e7a] {
+	id_empleado integer [ pk, increment, not null ]
+	nombre varchar(255)
+	edad integer
+	estado varchar(255)
+	modo_trabajo varchar(255)
+	fecha_contratacion date
+	anio_contratacion integer
+	id_departamento integer
+	id_puesto integer
+	id_locacion integer
+	id_performance integer
+	id_senority integer
+	salario numeric
+	anios_experiencia integer
+}
+
+Table DEPARTAMENTO [headercolor: #175e7a] {
+	id_departamento integer [ pk, increment, not null ]
+	Nombre varchar(255)
+}
+
+Table PUESTO [headercolor: #175e7a] {
+	id_puesto integer [ pk, increment, not null ]
+	Nombre varchar(255)
+}
+
+Table LOCACION [headercolor: #175e7a] {
+	id_locacion integer [ pk, increment, not null ]
+	pais varchar(255)
+	ciudad varchar(255)
+}
+
+Table PERFORMANCE [headercolor: #175e7a] {
+	id_performance integer [ pk, increment, not null ]
+	descripcion varchar(255)
+}
+
+Table SENORITY [headercolor: #175e7a] {
+	id_senority integer [ pk, increment, not null ]
+	descripcion varchar(255)
+}
+
+Ref fk_DEPARTAMENTO_id_departamento_EMPLEADO {
+	DEPARTAMENTO.id_departamento < EMPLEADO.id_departamento [ delete: no action, update: no action ]
+}
+
+Ref fk_PUESTO_id_puesto_EMPLEADO {
+	PUESTO.id_puesto < EMPLEADO.id_puesto [ delete: no action, update: no action ]
+}
+
+Ref fk_LOCACION_id_locacion_EMPLEADO {
+	LOCACION.id_locacion < EMPLEADO.id_locacion [ delete: no action, update: no action ]
+}
+
+Ref fk_PERFORMANCE_id_performance_EMPLEADO {
+	PERFORMANCE.id_performance < EMPLEADO.id_performance [ delete: no action, update: no action ]
+}
+
+Ref fk_SENORITY_id_senority_EMPLEADO {
+	SENORITY.id_senority < EMPLEADO.id_senority [ delete: no action, update: no action ]
+}

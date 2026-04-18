@@ -1,0 +1,89 @@
+Table DIM_EMPLEADO [headercolor: #175e7a] {
+	sk_empleado integer [ pk, not null ]
+	id_empleado integer [ not null ]
+	Nombre varchar(255)
+	Edad integer
+	Estado varchar(255)
+	Modo_trabajo varchar(255)
+	fecha_inicio date
+	fecha_fin date
+	flag_actual boolean
+}
+
+Table DIM_DEPARTAMENTO [headercolor: #175e7a] {
+	sk_departamento integer [ pk, increment, not null ]
+	nombre varchar(255)
+}
+
+Table DIM_PUESTO [headercolor: #175e7a] {
+	sk_puesto integer [ pk, increment, not null ]
+	descripcion varchar(255)
+}
+
+Table FACT_HR [headercolor: #175e7a] {
+	sk_fecha integer [ pk, not null ]
+	sk_empleado integer [ pk, not null ]
+	sk_departamento integer [ not null ]
+	sk_puesto integer [ not null ]
+	sk_locacion integer [ not null ]
+	sk_performance integer [ not null ]
+	sk_senority integer
+	salario numeric [ not null ]
+	var_salario numeric
+	anios_experiencia integer [ not null ]
+	dias_en_puesto integer
+}
+
+Table DIM_LOCACION [headercolor: #175e7a] {
+	sk_locacion integer [ pk, increment, not null ]
+	Pais varchar(255)
+	Ciudad varchar(255)
+}
+
+Table DIM_FECHA [headercolor: #175e7a] {
+	sk_fecha integer [ pk, not null ]
+	fecha date [ not null ]
+	Dia integer
+	Mes integer
+	Anio integer
+	Trimestre integer
+}
+
+Table DIM_SENORITY [headercolor: #175e7a] {
+	sk_senority integer [ pk, increment, not null ]
+	senority varchar(255)
+}
+
+Table DIM_PERFORMANCE [headercolor: #175e7a] {
+	sk_performance integer [ pk, increment, not null ]
+	performance varchar(255)
+	score_numerico integer
+}
+
+Ref fk_DIM_DEPARTAMENTO_id_departamento_FACT_HR {
+	DIM_DEPARTAMENTO.sk_departamento < FACT_HR.sk_departamento [ delete: no action, update: no action ]
+}
+
+Ref fk_DIM_PUESTO_id_puesto_FACT_HR {
+	DIM_PUESTO.sk_puesto < FACT_HR.sk_puesto [ delete: no action, update: no action ]
+}
+
+Ref fk_DIM_LOCACION_id_locacion_FACT_HR {
+	DIM_LOCACION.sk_locacion < FACT_HR.sk_locacion [ delete: no action, update: no action ]
+}
+
+Ref fk_DIM_EMPLEADO_sk_empleado_FACT_HR {
+	DIM_EMPLEADO.sk_empleado < FACT_HR.sk_empleado [ delete: no action, update: no action ]
+}
+
+Ref fk_DIM_FECHA_sk_fecha_FACT_HR {
+	DIM_FECHA.sk_fecha < FACT_HR.sk_fecha [ delete: no action, update: no action ]
+}
+
+Ref fk_DIM_SENORITY_id_senority_FACT_HR {
+	DIM_SENORITY.sk_senority < FACT_HR.sk_senority [ delete: no action, update: no action ]
+}
+
+Ref fk_DIM_PERFORMANCE_id_performance_FACT_HR {
+	DIM_PERFORMANCE.sk_performance < FACT_HR.sk_performance [ delete: no action, update: no action ]
+}
