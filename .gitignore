@@ -2,11 +2,11 @@
 env/
 venv/
 venv311/
-# Ignorar todo el contenido de Data
-Data/*
+# Ignorar todo el contenido de data
+data/*
 
 # Excepto el archivo .gitkeep
-!Data/.gitkeep
+!data/.gitkeep
 
 # Archivos temporales de Jupyter y Python
 __pycache__/
@@ -16,3 +16,10 @@ __pycache__/
 
 # Configuración de VS Code
 .vscode/
+
+# Archivos de enviroment
+.env
+
+# Archivos de log
+*.log
+logs/
