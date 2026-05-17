@@ -1,7 +1,7 @@
 # Librerías base (definir versiones después)
 numpy
 pandas
-
+pyarrow
 # Visualización
 matplotlib
 seaborn
