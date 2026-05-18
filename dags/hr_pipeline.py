@@ -34,6 +34,7 @@ with DAG(
         task_id="transformar_datos",
         python_callable=clean_data,
     )
+    
 
     # 4. Cargar en Staging
     tarea_cargar = PythonOperator(
