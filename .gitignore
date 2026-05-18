@@ -7,7 +7,9 @@ data/input/*
 data/output/*
 
 # Excepto el archivo .gitkeep
-!data/.gitkeep
+!data/input/.gitkeep
+!data/output/.gitkeep
+
 
 # Archivos temporales de Jupyter y Python
 __pycache__/
@@ -24,3 +26,4 @@ __pycache__/
 # Archivos de log
 *.log
 logs/*
+!logs/.gitkeep
