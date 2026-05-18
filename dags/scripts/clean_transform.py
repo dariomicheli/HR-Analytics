@@ -65,17 +65,46 @@ from scripts.config import (
 # ---------------------------------------------------------------------------
 
 _COLS_TITLE_CASE = ["department", "job_title", "country", "city"]
-
+ 
 _COLS_TEXTO_DB = [
     "department", "job_title", "status", "work_mode",
     "country", "city", "job_level", "performance_rating",
 ]
-
+ 
 _COLS_CATEGORICAS_FIJAS = [
     "department", "job_title", "status", "work_mode",
     "country", "city", "job_level",
 ]
-
+ 
+# Títulos honoríficos y grados académicos a eliminar de nombres
+_TITULOS = [
+    r"Univ\.Prof\.", r"Prof\.", r"Dra\.", r"Dr\.",
+    r"Mrs\.", r"Miss", r"Mr\.", r"Ms\.",
+    r"Sra\.", r"Sr\.", r"Doña", r"Don",
+    r"Ing\.", r"Lic\.", r"Arq\.", r"Tte\.", r"Gral\.",
+]
+ 
+_GRADOS = [
+    r"B\.Sc\.", r"M\.Sc\.", r"Ph\.D\.", r"B\.Eng\.", r"M\.Eng\.",
+    r"B\.A\.", r"M\.A\.", r"M\.D\.", r"J\.D\.",
+    r"MBA", r"MSc", r"BSc", r"PhD",
+]
+ 
+_TITULOS_RE = re.compile(
+    r"^\s*(?:" + "|".join(_TITULOS) + r")\s+",
+    flags=re.IGNORECASE,
+)
+_GRADOS_RE = re.compile(
+    r"\s+(?:" + "|".join(_GRADOS) + r")\s*$",
+    flags=re.IGNORECASE,
+)
+ 
+# Partículas que permanecen en minúscula dentro de un nombre
+_PARTICULAS = {
+    "van", "von", "de", "del", "den", "der",
+    "da", "di", "du", "la", "le", "los", "las", "el",
+}
+ 
 # ===========================================================================
 # Punto de entrada público
 # ===========================================================================
@@ -106,6 +135,7 @@ def clean_data(**context) -> pd.DataFrame:
 # Funciones auxiliares
 # ===========================================================================
 
+# Auxiliares  encabezados y textos
 
 def _estandarizar_encabezados(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -122,7 +152,6 @@ def _estandarizar_encabezados(df: pd.DataFrame) -> pd.DataFrame:
     logger.debug("Encabezados normalizados a snake_case.")
     return df
 
-
 def _limpiar_texto_general(df: pd.DataFrame) -> pd.DataFrame:
     
     """Trim + colapso de espacios en todas las columnas de texto."""
@@ -133,7 +162,6 @@ def _limpiar_texto_general(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df
 
-
 def _aplicar_title_case(df: pd.DataFrame) -> pd.DataFrame:
 
     """Title-case en columnas categóricas con sentido semántico."""
@@ -142,7 +170,6 @@ def _aplicar_title_case(df: pd.DataFrame) -> pd.DataFrame:
     if cols:
         df[cols] = df[cols].apply(lambda col: col.str.title())
     return df
-
 
 def _limpiar_nombre(nombre: str) -> str:
     """
@@ -168,7 +195,6 @@ def _limpiar_nombre(nombre: str) -> str:
     ]
     return " ".join(palabras_limpias)
 
-
 def _limpiar_columna_nombres(df: pd.DataFrame, col: str = "full_name") -> pd.DataFrame:
     """Aplica `_limpiar_nombre` y descarta filas que queden vacías."""
 
@@ -187,89 +213,7 @@ def _limpiar_columna_nombres(df: pd.DataFrame, col: str = "full_name") -> pd.Dat
     logger.info("✓ Limpieza de nombres completada.")
     return df
 
-
-# ===========================================================================
-# Pasos del pipeline (ordenados y con firma clara)
-# ===========================================================================
-
-
-def _paso_encabezados_y_texto(df: pd.DataFrame) -> pd.DataFrame:
-    df = _estandarizar_encabezados(df)
-    df = _limpiar_texto_general(df)
-    df = _aplicar_title_case(df)
-    df = _limpiar_columna_nombres(df)
-    return df
-
-
-def _paso_clave_primaria(df: pd.DataFrame) -> pd.DataFrame:
-    """Elimina nulos y duplicados en employee_id."""
-    nulos = df["employee_id"].isna().sum()
-    if nulos > 0:
-        logger.warning("  → employee_id: %s registros con ID nulo eliminados.", f"{nulos:,}")
-        df = df.dropna(subset=["employee_id"])
-
-    duplicados = df["employee_id"].duplicated().sum()
-    if duplicados > 0:
-        logger.warning(
-            "  → employee_id: %s IDs duplicados. Conservando primera aparición.",
-            f"{duplicados:,}",
-        )
-        df = df.drop_duplicates(subset=["employee_id"], keep="first")
-
-    logger.info("✓ Clave primaria validada. Filas activas: %s", f"{len(df):,}")
-    return df
-
-
-def _paso_casteo_tipos(df: pd.DataFrame) -> pd.DataFrame:
-    """Castea fechas, salario, texto y enteros secundarios."""
-
-    # ── Fechas ────────────────────────────────────────────────────────────
-    df["hire_date"] = pd.to_datetime(df["hire_date"], errors="coerce")
-    nats = df["hire_date"].isna().sum()
-    if nats > 0:
-        logger.warning("  → hire_date: %s fechas inválidas → NaT.", f"{nats:,}")
-
-    # ── Salary ────────────────────────────────────────────────────────────
-    if df["salary"].dtype == object:
-        df["salary"] = df["salary"].str.replace(r"[^\d.-]", "", regex=True)
-    df["salary"] = pd.to_numeric(df["salary"], errors="coerce").astype("float32").round(2)
-
-    # ── Columnas de texto → str limpio, nulos literales → NaN ─────────────
-    # Mantenemos str (no category) por compatibilidad con drivers SQL.
-    cols_texto = [c for c in _COLS_TEXTO_DB if c in df.columns]
-    for col in cols_texto:
-        df[col] = df[col].astype(str).str.strip().replace(STRINGS_NULOS, np.nan)
-
-    # ── Enteros secundarios (Int16) ───────────────────────────────────────
-    for col in ("experience_years", "age"):
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int16")
-
-    logger.info("✓ Tipos casteados. Filas activas: %s", f"{len(df):,}")
-    return df
-
-
-def _paso_nulos_categoricas(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Imputa nulos en columnas categóricas con centinela o estrategia adaptativa
-    para performance_rating.
-    """
-
-    # Centinela fijo para categóricas no críticas
-    cols_fijas = [c for c in _COLS_CATEGORICAS_FIJAS if c in df.columns]
-    for col in cols_fijas:
-        nulos = df[col].isna().sum()
-        if nulos > 0:
-            df[col] = df[col].fillna(VALOR_CENTINELA)
-            logger.info("  → %s: %s nulos → '%s'.", col, f"{nulos:,}", VALOR_CENTINELA)
-
-    # Estrategia adaptativa para performance_rating
-    if "performance_rating" in df.columns:
-        df = _imputar_performance_rating(df)
-
-    logger.info("✓ Nulos en categóricas tratados.")
-    return df
-
+# Auxiliar columnas categoricas
 
 def _imputar_performance_rating(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -314,17 +258,7 @@ def _imputar_performance_rating(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
-def _paso_rango_numericos(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Corrige valores fuera de rango en salary, age y experience_years.
-    """
-    df = _corregir_salary(df)
-    df = _corregir_age(df)
-    df = _corregir_experience_years(df)
-    logger.info("✓ Rangos numéricos corregidos.")
-    return df
-
+# Auxiliares  rangos numericos
 
 def _corregir_salary(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -396,6 +330,95 @@ def _corregir_experience_years(df: pd.DataFrame) -> pd.DataFrame:
         )
     return df
 
+
+# ===========================================================================
+# Pasos del pipeline 
+# ===========================================================================
+
+
+def _paso_encabezados_y_texto(df: pd.DataFrame) -> pd.DataFrame:
+    df = _estandarizar_encabezados(df)
+    df = _limpiar_texto_general(df)
+    df = _aplicar_title_case(df)
+    df = _limpiar_columna_nombres(df)
+    return df
+
+def _paso_clave_primaria(df: pd.DataFrame) -> pd.DataFrame:
+    """Elimina nulos y duplicados en employee_id."""
+    nulos = df["employee_id"].isna().sum()
+    if nulos > 0:
+        logger.warning("  → employee_id: %s registros con ID nulo eliminados.", f"{nulos:,}")
+        df = df.dropna(subset=["employee_id"])
+
+    duplicados = df["employee_id"].duplicated().sum()
+    if duplicados > 0:
+        logger.warning(
+            "  → employee_id: %s IDs duplicados. Conservando primera aparición.",
+            f"{duplicados:,}",
+        )
+        df = df.drop_duplicates(subset=["employee_id"], keep="first")
+
+    logger.info("✓ Clave primaria validada. Filas activas: %s", f"{len(df):,}")
+    return df
+
+def _paso_casteo_tipos(df: pd.DataFrame) -> pd.DataFrame:
+    """Castea fechas, salario, texto y enteros secundarios."""
+
+    # ── Fechas ────────────────────────────────────────────────────────────
+    df["hire_date"] = pd.to_datetime(df["hire_date"], errors="coerce")
+    nats = df["hire_date"].isna().sum()
+    if nats > 0:
+        logger.warning("  → hire_date: %s fechas inválidas → NaT.", f"{nats:,}")
+
+    # ── Salary ────────────────────────────────────────────────────────────
+    if df["salary"].dtype == object:
+        df["salary"] = df["salary"].str.replace(r"[^\d.-]", "", regex=True)
+    df["salary"] = pd.to_numeric(df["salary"], errors="coerce").astype("float32").round(2)
+
+    # ── Columnas de texto → str limpio, nulos literales → NaN ─────────────
+    # Mantenemos str (no category) por compatibilidad con drivers SQL.
+    cols_texto = [c for c in _COLS_TEXTO_DB if c in df.columns]
+    for col in cols_texto:
+        df[col] = df[col].astype(str).str.strip().replace(STRINGS_NULOS, np.nan)
+
+    # ── Enteros secundarios (Int16) ───────────────────────────────────────
+    for col in ("experience_years", "age"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int16")
+
+    logger.info("✓ Tipos casteados. Filas activas: %s", f"{len(df):,}")
+    return df
+
+def _paso_nulos_categoricas(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Imputa nulos en columnas categóricas con centinela o estrategia adaptativa
+    para performance_rating.
+    """
+
+    # Centinela fijo para categóricas no críticas
+    cols_fijas = [c for c in _COLS_CATEGORICAS_FIJAS if c in df.columns]
+    for col in cols_fijas:
+        nulos = df[col].isna().sum()
+        if nulos > 0:
+            df[col] = df[col].fillna(VALOR_CENTINELA)
+            logger.info("  → %s: %s nulos → '%s'.", col, f"{nulos:,}", VALOR_CENTINELA)
+
+    # Estrategia adaptativa para performance_rating
+    if "performance_rating" in df.columns:
+        df = _imputar_performance_rating(df)
+
+    logger.info("✓ Nulos en categóricas tratados.")
+    return df
+
+def _paso_rango_numericos(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Corrige valores fuera de rango en salary, age y experience_years.
+    """
+    df = _corregir_salary(df)
+    df = _corregir_age(df)
+    df = _corregir_experience_years(df)
+    logger.info("✓ Rangos numéricos corregidos.")
+    return df
 
 def _resumen_final(df: pd.DataFrame) -> None:
     """Loguea nulos remanentes (intencionales) al finalizar el pipeline."""
