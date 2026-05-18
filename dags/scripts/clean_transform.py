@@ -41,16 +41,16 @@ Contrato de interfaz
 
 
 # Librerias Utilizas
+from __future__ import annotations # PARA LAS ANOTACIONES CON LINEA
+
 import logging
 import pandas as pd
-import logging
 import re
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 # Importacion de constantes
-from __future__ import annotations
 
 from scripts.config import (
     EDAD_MAX,
@@ -105,31 +105,6 @@ _PARTICULAS = {
     "da", "di", "du", "la", "le", "los", "las", "el",
 }
  
-# ===========================================================================
-# Punto de entrada público
-# ===========================================================================
-
-
-def clean_data(**context) -> pd.DataFrame:
-    
-    """
-    Ejecuta el pipeline completo de limpieza y transformación.
-
-    Parámetros
-    ----------
-    df : pd.DataFrame
-        DataFrame crudo proveniente de extract.py.
-
-    Retorna
-    -------
-    pd.DataFrame
-        DataFrame limpio, listo para quality_checks → load.
-    """
-    logger.info("── Iniciando clean_transform ──────────────────────────────")
-    ti = context['ti']
-    df = ti.xcom_pull(task_ids='extract_csv')
-
-
 
 # ===========================================================================
 # Funciones auxiliares
@@ -274,8 +249,7 @@ def _corregir_salary(df: pd.DataFrame) -> pd.DataFrame:
             .groupby(["job_level", "department"])["salary"]
             .agg(lower="min", upper="max")
         )
-        df = df.join(group_stats, on=["job_level", "department"])
-
+        df = df.merge(group_stats, on=["job_level", "department"], how="left")
         abs_sal   = df["salary"].abs()
         in_range  = mask_neg & (abs_sal >= df["lower"]) & (abs_sal <= df["upper"])
         out_range = mask_neg & ~in_range
@@ -379,12 +353,16 @@ def _paso_casteo_tipos(df: pd.DataFrame) -> pd.DataFrame:
     # Mantenemos str (no category) por compatibilidad con drivers SQL.
     cols_texto = [c for c in _COLS_TEXTO_DB if c in df.columns]
     for col in cols_texto:
-        df[col] = df[col].astype(str).str.strip().replace(STRINGS_NULOS, np.nan)
-
+        df[col] = (
+            df[col]
+            .astype("string")
+            .str.strip()
+            .replace(STRINGS_NULOS, np.nan)
+        )
     # ── Enteros secundarios (Int16) ───────────────────────────────────────
     for col in ("experience_years", "age"):
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int16")
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int32")
 
     logger.info("✓ Tipos casteados. Filas activas: %s", f"{len(df):,}")
     return df
@@ -432,23 +410,42 @@ def _resumen_final(df: pd.DataFrame) -> None:
             f"{len(df):,}", nulos.to_dict(),
         )
 
+# ===========================================================================
+# Punto de entrada público
+# ===========================================================================
 
 
+def clean_data(**context) -> pd.DataFrame:
 
-    # La columna 'Year' es redundante (derivable de hire_date)
+    """
+    Ejecuta el pipeline completo de limpieza y transformación.
+ 
+    Parámetros
+    ----------
+    df : pd.DataFrame
+        DataFrame crudo proveniente de extract.py.
+ 
+    Retorna
+    -------
+    pd.DataFrame
+        DataFrame limpio, listo para quality_checks → load.
+    """
+    ti = context.get("ti")
+    if ti is None:
+        raise ValueError("No TaskInstance (ti) en contexto Airflow")
+    df = ti.xcom_pull(task_ids="extract_csv")
+
+    logger.info("── Iniciando clean_transform ──────────────────────────────")
+  # La columna 'Year' es redundante (derivable de hire_date)
     df = df.drop(columns=["Year"], errors="ignore")
-
+ 
     df = _paso_encabezados_y_texto(df)   # 1. Headers + texto + nombres
     df = _paso_clave_primaria(df)        # 2. PK: nulos y duplicados
     df = _paso_casteo_tipos(df)          # 3. Fechas, salary, str, Int16
     df = _paso_nulos_categoricas(df)     # 4. Imputación categóricas
     df = _paso_rango_numericos(df)       # 5. Rangos: salary, age, exp
-
+ 
     _resumen_final(df)
-    
-    df=df.reset_index(drop=True)
-
     logger.info("── clean_transform finalizado ─────────────────────────────")
-    return df 
-
-
+ 
+    return df.reset_index(drop=True)
