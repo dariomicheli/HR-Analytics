@@ -1,3 +1,4 @@
+from scripts.build_aggregations import refresh_materialized_views
 from scripts.archive import archive_file
 from scripts.config import RUTA_INPUT
 from scripts.discover import discover_input_file
@@ -70,10 +71,15 @@ with DAG(
         python_callable=load_data_postgres,
     )
 
+    tarea_actualizar_vm = PythonOperator(
+        task_id="refresh_materialized_views",
+        python_callable=refresh_materialized_views,
+    )
+
     tarea_archivar = PythonOperator(
         task_id="archive_file",
         python_callable=archive_file,
     )
 
     # Definimos el orden estricto de ejecución (El Pipeline)
-    tarea_esperar >> tarea_descubrir >> tarea_validar >> tarea_extraer >> tarea_transformar >> tarea_cargar >> tarea_archivar
+    tarea_esperar >> tarea_descubrir >> tarea_validar >> tarea_extraer >> tarea_transformar >> tarea_cargar >> tarea_actualizar_vm >> tarea_archivar
