@@ -63,7 +63,7 @@ logger = _setup_logger(__name__)
 
 # Importar constantes del módulo de configuración
 # En producción, descomentar y adaptar rutas según la estructura real
-from dags.scripts.config import (
+from scripts.config import (
         EDAD_MAX,      
         EDAD_MIN,      
         EXP_MAX,      
@@ -298,7 +298,7 @@ def _etapa_limpieza_claves(df: pd.DataFrame) -> pd.DataFrame:
         
         if n_vacios > 0:
             logger.warning(f"  ⚠️  {n_vacios:,} nombres quedaron vacíos tras limpieza. Eliminando.")
-            df = df[~mask_nombres_vacios].copy()
+            df = df[~mask_nombres_vacios]
         
         logger.debug(f"  Nombres normalizados y validados")
     
@@ -310,13 +310,13 @@ def _etapa_limpieza_claves(df: pd.DataFrame) -> pd.DataFrame:
     n_nulos_id = df["employee_id"].isna().sum()
     if n_nulos_id > 0:
         logger.warning(f"  ⚠️  {n_nulos_id:,} employee_id nulos. Eliminando.")
-        df = df.dropna(subset=["employee_id"]).copy()
+        df = df.dropna(subset=["employee_id"])
     
     # Eliminar duplicados (mantener primer ocurrencia)
     n_duplicados = df["employee_id"].duplicated().sum()
     if n_duplicados > 0:
         logger.warning(f"  ⚠️  {n_duplicados:,} employee_id duplicados. Conservando primer ocurrencia.")
-        df = df.drop_duplicates(subset=["employee_id"], keep="first").copy()
+        df = df.drop_duplicates(subset=["employee_id"], keep="first")
     
     filas_eliminadas = filas_antes - len(df)
     if filas_eliminadas > 0:
