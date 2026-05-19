@@ -1,5 +1,5 @@
 import logging
-from scripts.config import COLUMNAS_ESPERADAS
+from scripts.config import COLUMNAS_ESPERADAS, RUTA_TEMP
 import pandas as pd
 
 
@@ -14,6 +14,9 @@ def extract_csv(**context):
     df = pd.read_csv(ruta_archivo, usecols=COLUMNAS_ESPERADAS,
                      encoding='utf-8')
 
+    ruta_destino = f"{RUTA_TEMP}/extract.parquet"
+    df.to_parquet(ruta_destino, engine='pyarrow', index=False)
+
     logging.info(
-        f"Extracción completada. Número de registros extraídos: {len(df)}")
-    return df
+        f"Extracción completada y guardada en {ruta_destino}. Número de registros extraídos: {len(df)}")
+    return ruta_destino

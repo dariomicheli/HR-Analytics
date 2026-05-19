@@ -6,6 +6,7 @@ from scripts.config import (
     EDAD_MAX,
     EDAD_MIN,
     EXP_MAX,
+    RUTA_TEMP,
     STRINGS_NULOS,
     VALOR_CENTINELA)
 import logging
@@ -857,7 +858,7 @@ def _etapa_reporte_final(
 # ===========================================================================
 
 
-def clean_data(**context) -> pd.DataFrame:
+def clean_data(**context) -> str:
     """
     PIPELINE COMPLETO DE LIMPIEZA Y TRANSFORMACIÓN DE DATOS
 
@@ -882,7 +883,11 @@ def clean_data(**context) -> pd.DataFrame:
     ti = context.get("ti")
     if ti is None:
         raise ValueError("No TaskInstance (ti) en contexto Airflow")
-    df = ti.xcom_pull(task_ids="extract_csv")
+
+    extract_filepath = ti.xcom_pull(task_ids="extract_csv")
+
+    # Cargar el DataFrame desde el archivo Parquet extraído
+    df = pd.read_parquet(extract_filepath, engine='pyarrow')  # type: ignore
 
     try:
         # Guardar DataFrame original para comparación
@@ -904,7 +909,10 @@ def clean_data(**context) -> pd.DataFrame:
         # Reset de índices para limpieza final
         df = df.reset_index(drop=True)
 
-        return df
+        ruta_destino = f"{RUTA_TEMP}/clean.parquet"
+        df.to_parquet(ruta_destino, engine='pyarrow', index=False)
+
+        return ruta_destino
 
     except Exception as e:
         logger.critical(f"❌ PIPELINE FALLIDO: {str(e)}")

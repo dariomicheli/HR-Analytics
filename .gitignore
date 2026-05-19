@@ -6,11 +6,13 @@ venv311/
 data/input/*
 data/output/*
 data/archive/*
+data/temp/*
 
 # Excepto el archivo .gitkeep
 !data/input/.gitkeep
 !data/output/.gitkeep
 !data/archive/.gitkeep
+!data/temp/.gitkeep
 
 # Archivos temporales de Jupyter y Python
 __pycache__/

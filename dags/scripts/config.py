@@ -5,6 +5,17 @@ NOMBRE_ARCHIVO = "hr_raw.csv"
 RUTA_INPUT = '/opt/airflow/data/input/'
 RUTA_OUTPUT = '/opt/airflow/data/output/'
 RUTA_ARCHIVE = '/opt/airflow/data/archive/'
+RUTA_TEMP = '/opt/airflow/data/temp/'
+
+# Conexiones
+POSTGRES_DWH_CONN_ID = 'postgres_dwh'
+
+# Columnas de la tabla staging
+COLUMNAS_STG: list[str] = [
+    "employee_id", "full_name", "department", "job_title", "hire_date",
+    "performance_rating", "experience_years", "status", "work_mode",
+    "salary", "country", "city", "age", "job_level",
+]
 
 
 # ================================================
