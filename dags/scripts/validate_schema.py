@@ -2,11 +2,6 @@ import logging
 import pandas as pd
 from scripts.config import COLUMNAS_ESPERADAS
 
-# dos columnas iguales
-# encoding
-# delimitador
-# #que el archivo no esté vacío
-
 
 def validate_schema(**context):
     ti = context['ti']
