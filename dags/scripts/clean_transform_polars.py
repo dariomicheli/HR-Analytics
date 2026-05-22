@@ -1,115 +1,216 @@
-import polars as pl
+from __future__ import annotations
 import logging
+import logging.handlers
 import re
-from scripts.config import RUTA_TEMP, EDAD_MIN, EDAD_MAX, EXP_MAX, VALOR_CENTINELA
+import sys
+from datetime import datetime
+import polars as pl
 
-logger = logging.getLogger(__name__)
+from scripts.config import (
+    EDAD_MAX,
+    EDAD_MIN,
+    EXP_MAX,
+    RUTA_TEMP,
+    STRINGS_NULOS,
+    VALOR_CENTINELA
+)
 
-# Constantes de limpieza originales mantenidas intactas
-_TITULOS = [r"Univ\.Prof\.", r"Prof\.", r"Dra\.", r"Dr\.", r"Mrs\.", r"Miss", r"Mr\.", r"Ms\.",
-            r"Sra\.", r"Sr\.", r"Doña", r"Don", r"Ing\.", r"Lic\.", r"Arq\.", r"Tte\.", r"Gral\."]
-_GRADOS = [r"B\.Sc\.", r"M\.Sc\.", r"Ph\.D\.", r"B\.Eng\.", r"M\.Eng\.",
-           r"B\.A\.", r"M\.A\.", r"M\.D\.", r"J\.D\.", r"MBA", r"MSc", r"BSc", r"PhD"]
-_PARTICULAS = {"van", "von", "de", "del", "den", "der",
-               "da", "di", "du", "la", "le", "los", "las", "el"}
+# ===========================================================================
+# CONFIGURACIÓN DE LOGGING
+# ===========================================================================
+
+
+def _setup_logger(name: str = __name__, level: int = logging.INFO) -> logging.Logger:
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+
+    if logger.handlers:
+        return logger
+
+    formatter = logging.Formatter(
+        fmt='[%(asctime)s] %(levelname)-8s | %(name)s | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    return logger
+
+
+logger = _setup_logger(__name__)
+
+# ===========================================================================
+# CONSTANTES Y CONFIGURACIÓN MANTENIDAS
+# ===========================================================================
+
+_COLS_TITLE_CASE = ["department", "job_title", "country", "city"]
+_COLS_CATEGORICAS_FIJAS = ["department", "job_title",
+                           "status", "work_mode", "country", "city", "job_level"]
+
+_TITULOS = [
+    r"Univ\.Prof\.", r"Prof\.", r"Dra\.", r"Dr\.",
+    r"Mrs\.", r"Miss", r"Mr\.", r"Ms\.",
+    r"Sra\.", r"Sr\.", r"Doña", r"Don",
+    r"Ing\.", r"Lic\.", r"Arq\.", r"Tte\.", r"Gral\.",
+]
+
+_GRADOS = [
+    r"B\.Sc\.", r"M\.Sc\.", r"Ph\.D\.", r"B\.Eng\.", r"M\.Eng\.",
+    r"B\.A\.", r"M\.A\.", r"M\.D\.", r"J\.D\.",
+    r"MBA", r"MSc", r"BSc", r"PhD",
+]
 
 _TITULOS_RE = re.compile(
     r"^\s*(?:" + "|".join(_TITULOS) + r")\s+", flags=re.IGNORECASE)
 _GRADOS_RE = re.compile(
     r"\s+(?:" + "|".join(_GRADOS) + r")\s*$", flags=re.IGNORECASE)
 
+_PARTICULAS = {
+    "van", "von", "de", "del", "den", "der",
+    "da", "di", "du", "la", "le", "los", "las", "el",
+}
+
+# ===========================================================================
+# FUNCIONES AUXILIARES - LIMPIEZA DE TEXTO
+# ===========================================================================
+
 
 def _limpiar_nombre_exacto(nombre: str) -> str:
-    """Tu función original, mantenida para respetar la lógica de partículas."""
-    if not nombre:
+    """
+    Normaliza nombres personales respetando la lógica original de partículas.
+    """
+    if not nombre or not isinstance(nombre, str):
         return ""
+
+    nombre = nombre.strip()
     nombre = _TITULOS_RE.sub("", nombre)
     nombre = _GRADOS_RE.sub("", nombre)
     nombre = re.sub(r"[^\w\s\-\.\']", "", nombre, flags=re.UNICODE)
-    palabras = re.sub(r"\s+", " ", nombre).strip().split()
-    return " ".join([p.lower() if i > 0 and p.lower() in _PARTICULAS else p.capitalize() for i, p in enumerate(palabras)])
+    nombre = re.sub(r"\s+", " ", nombre).strip()
+
+    palabras = nombre.split()
+    palabras_limpias = [
+        palabra.lower() if i > 0 and palabra.lower() in _PARTICULAS
+        else palabra.capitalize()
+        for i, palabra in enumerate(palabras)
+    ]
+
+    return " ".join(palabras_limpias)
+
+# ===========================================================================
+# FUNCIÓN PRINCIPAL DEL PIPELINE
+# ===========================================================================
 
 
 def clean_data(**context) -> str:
+    logger.info("╔" + "=" * 68 + "╗")
+    logger.info(
+        "║" + " INICIANDO PIPELINE: clean_transform (Polars) ".center(68) + "║")
+    logger.info("╚" + "=" * 68 + "╝")
+
     ti = context.get("ti")
+    if ti is None:
+        raise ValueError("No TaskInstance (ti) en contexto Airflow")
+
     extract_filepath = ti.xcom_pull(task_ids="extract_csv")
 
-    logger.info("Iniciando pipeline exacto con Polars...")
-
-    # ---------------------------------------------------------
-    # 1. EJECUCIÓN LAZY: Limpieza base, casteos y límites
-    # ---------------------------------------------------------
+    # 1. Inicio de contexto Lazy (No consume RAM)
     q = pl.scan_parquet(extract_filepath)
 
-    q = (
-        q.rename({col: col.strip().lower().replace(" ", "_")
-                 for col in q.columns})
-        .drop_nulls(subset=["employee_id"])
-        .unique(subset=["employee_id"], keep="first")
-        .with_columns([
-            pl.col("hire_date").str.strptime(
-                pl.Date, format="%Y-%m-%d", strict=False),
-            pl.col("salary").str.replace_all(
-                r"[^\d.-]", "").cast(pl.Float32, strict=False),
-            pl.col("age").cast(pl.Int32, strict=False),
-            pl.col("experience_years").cast(pl.Int32, strict=False),
-            pl.col(["department", "job_title", "status", "work_mode", "country",
-                   "city", "job_level"]).str.to_lowercase().str.strip_chars()
-        ])
-    )
+    # 2. Estandarizar encabezados a snake_case sin disparar Alertas de Performance
+    q = q.rename({
+        col: col.strip().lower().replace(" ", "_")
+        for col in q.collect_schema().names()
+    })
 
-    # Limpieza de nombres aplicando tu función de Python
+    # 3. Validación de clave primaria (employee_id)
+    q = q.drop_nulls(subset=["employee_id"]).unique(
+        subset=["employee_id"], keep="first")
+
+    # 4. Type Casting Blindado (Casteo a String antes de operaciones de cadena)
+    q = q.with_columns([
+        pl.col("hire_date").cast(pl.String).str.strptime(
+            pl.Date, format="%Y-%m-%d", strict=False),
+        pl.col("salary").cast(pl.String).str.replace_all(
+            r"[^\d.-]", "").cast(pl.Float32, strict=False),
+        pl.col("age").cast(pl.Int32, strict=False),
+        pl.col("experience_years").cast(pl.Int32, strict=False),
+        pl.col(_COLS_CATEGORICAS_FIJAS).cast(
+            pl.String).str.to_lowercase().str.strip_chars()
+    ])
+
+    # 5. Limpieza inteligente de nombres propios (Uso de map_elements para mantener partículas)
     q = q.with_columns(
-        pl.col("full_name").map_elements(
+        pl.col("full_name").cast(pl.String).map_elements(
             _limpiar_nombre_exacto, return_dtype=pl.String)
     ).filter(pl.col("full_name") != "")
 
-    # Limpieza de rangos numéricos igual a Pandas
+    # 6. Corrección de Rangos Numéricos usando Window Functions (.over)
     q = q.with_columns([
         pl.col("salary").min().over(
             ["job_level", "department"]).alias("q_min"),
         pl.col("salary").max().over(["job_level", "department"]).alias("q_max")
     ]).with_columns([
-        pl.when((pl.col("salary") < 0) & (pl.col("salary").abs() >= pl.col(
-            "q_min")) & (pl.col("salary").abs() <= pl.col("q_max")))
+        pl.when((pl.col("salary") < 0) &
+                (pl.col("salary").abs() >= pl.col("q_min")) &
+                (pl.col("salary").abs() <= pl.col("q_max")))
           .then(pl.col("salary").abs())
           .when(pl.col("salary") < 0).then(None)
           .otherwise(pl.col("salary")).alias("salary"),
+
         pl.when((pl.col("age") < EDAD_MIN) | (pl.col("age") > EDAD_MAX)).then(
             None).otherwise(pl.col("age")).alias("age"),
+
         pl.when(pl.col("experience_years") < 0).then(
             pl.col("experience_years").abs())
-          .when(pl.col("experience_years") > EXP_MAX).then(None).otherwise(pl.col("experience_years")).alias("experience_years")
+          .when(pl.col("experience_years") > EXP_MAX).then(None)
+          .otherwise(pl.col("experience_years")).alias("experience_years")
     ]).drop(["q_min", "q_max"])
 
-    # Imputación de Numéricas y Categóricas Fijas
+    # 7. Imputación de Numéricas y Categorías Fijas por Mediana
     q = q.with_columns([
         pl.col("salary").fill_null(pl.col("salary").median().over(
             ["job_level", "department"])).fill_null(pl.col("salary").median()),
-        pl.col("age").fill_null(pl.col("age").median().over(
-            ["job_level", "department"])).fill_null(pl.col("age").median()),
-        pl.col("experience_years").fill_null(pl.col("experience_years").median().over(
-            ["job_level", "department"])).fill_null(pl.col("experience_years").median()),
-        pl.col(["department", "job_title", "status", "work_mode",
-               "country", "city", "job_level"]).fill_null(VALOR_CENTINELA)
+
+        # Agregamos .round(0).cast(pl.Int32) para evitar que la mediana convierta los enteros a Float
+        pl.col("age")
+          .fill_null(pl.col("age").median().over(["job_level", "department"]))
+          .fill_null(pl.col("age").median())
+          .round(0)
+          .cast(pl.Int32),
+
+        pl.col("experience_years")
+          .fill_null(pl.col("experience_years").median().over(["job_level", "department"]))
+          .fill_null(pl.col("experience_years").median())
+          .round(0)
+          .cast(pl.Int32),
+
+        pl.col(_COLS_CATEGORICAS_FIJAS).fill_null(VALOR_CENTINELA)
     ])
 
-    # ---------------------------------------------------------
-    # 2. MATERIALIZACIÓN PARA LOGS Y LÓGICA ADAPTATIVA
-    # ---------------------------------------------------------
-    # Ejecutamos el plan. Como Polars es súper eficiente, esto ocupa poca RAM
+    # -----------------------------------------------------------------------
+    # MATERIALIZACIÓN CONTROLADA (Para reportes y lógicas de conteo adaptativo)
+    # -----------------------------------------------------------------------
+    logger.info("Evaluando el plan Lazy y materializando registros limpios...")
     df = q.collect()
     total_filas = len(df)
 
-    # Lógica Adaptativa de performance_rating
+    # 8. Tratamiento adaptativo para performance_rating según volumen de nulos
     if "performance_rating" in df.columns:
+        df = df.with_columns(pl.col("performance_rating").cast(
+            pl.String).str.to_lowercase().str.strip_chars())
         nulos_perf = df["performance_rating"].null_count()
+
         if nulos_perf > 0:
             pct_nulos = (nulos_perf / total_filas) * 100
+            logger.info(
+                f"  performance_rating: {nulos_perf:,} nulos detectados ({pct_nulos:.2f}%)")
+
             if pct_nulos < 1:
                 df = df.drop_nulls(subset=["performance_rating"])
             elif pct_nulos < 5:
-                # Imputar por moda de grupo
                 df = df.with_columns(
                     pl.col("performance_rating").fill_null(
                         pl.col("performance_rating").drop_nulls().mode(
@@ -120,32 +221,44 @@ def clean_data(**context) -> str:
                 df = df.with_columns(pl.col("performance_rating").fill_null(
                     f"unknown_{VALOR_CENTINELA}"))
 
-    # Validaciones cruzadas (Logs)
+    # 9. Validaciones lógicas cruzadas (Manteniendo tus Logs de advertencia originales)
     inconsistentes = df.filter(
         pl.col("experience_years") > (pl.col("age") - 16)).height
     if inconsistentes > 0:
         logger.warning(
-            f"⚠️ {inconsistentes:,} registros: experience_years > (age - 16)")
+            f"  ⚠️  {inconsistentes:,} registros detectados: experience_years > (age - 16)")
 
     salario_cero = df.filter(pl.col("salary") == 0).height
     if salario_cero > 0:
-        logger.warning(f"⚠️ {salario_cero:,} registros con salary = 0")
+        logger.warning(
+            f"  ⚠️  {salario_cero:,} registros detectados con salary = 0")
 
-    # ---------------------------------------------------------
-    # 3. NORMALIZACIÓN FINAL Y GUARDADO
-    # ---------------------------------------------------------
-    cols_title = ["department", "job_title", "country", "city"]
+    fecha_futura = df.filter(pl.col("hire_date") >
+                             datetime.now().date()).height
+    if fecha_futura > 0:
+        logger.warning(
+            f"  ⚠️  {fecha_futura:,} registros detectados con hire_date en el futuro")
+
+    # 10. Normalización Final a Title Case
     df = df.with_columns([
-        pl.col(c).str.to_titlecase() for c in cols_title if c in df.columns
+        pl.col(c).cast(pl.String).str.to_titlecase() for c in _COLS_TITLE_CASE if c in df.columns
     ])
 
     if "performance_rating" in df.columns:
         df = df.with_columns(pl.col("performance_rating").str.replace_all(
             "_", " ").str.to_titlecase())
 
+    # Guardado físico final
     ruta_destino = f"{RUTA_TEMP}/clean.parquet"
     df.write_parquet(ruta_destino)
 
-    logger.info(
-        "✅ Pipeline completado respetando 100% de las reglas originales.")
+    logger.info("=" * 70)
+    logger.info("🎯 REPORTE FINAL DEL PIPELINE (POLARS MIGRATION)")
+    logger.info("=" * 70)
+    logger.info(f"  Registros procesados finales de salida: {len(df):,}")
+    logger.info("  Estructura y Tipos de datos en destino:")
+    for col, dtype in zip(df.columns, df.dtypes):
+        logger.info(f"    - {col}: {dtype}")
+    logger.info("=" * 70)
+
     return ruta_destino
