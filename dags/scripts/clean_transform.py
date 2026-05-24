@@ -339,7 +339,6 @@ def _etapa_7_imputacion_nulos(q: pl.LazyFrame) -> pl.LazyFrame:
 
     return q
 
-
 def _etapa_8_correccion_edad_minima_laboral(df: pl.DataFrame) -> pl.DataFrame:
     """
     ETAPA 8: REGLA DE NEGOCIO – Corrección de hire_date por edad mínima laboral.
@@ -347,32 +346,39 @@ def _etapa_8_correccion_edad_minima_laboral(df: pl.DataFrame) -> pl.DataFrame:
     """
     logger.info("▶️  ETAPA 8: Corrección por Edad Mínima Laboral (SOLO ACTIVOS)")
 
+    # Definimos la constante de Python como un literal de Polars de tipo Fecha
+    fecha_dataset_lit = pl.lit(FECHA_DATASET).cast(pl.Date)
+
     es_activo_con_datos = (
         (pl.col("status") == "active") &    # normalizado en etapa 3
         (pl.col("hire_date").is_not_null()) &
         (pl.col("age").is_not_null())
     )
 
+    # 1. Calculamos la edad_al_contratar usando expresiones 100% nativas
     df = df.with_columns(
         pl.when(es_activo_con_datos)
           .then(
-              pl.col("age") - ((FECHA_DATASET - pl.col("hire_date")).dt.total_days() / 365.25)
+              pl.col("age") - ((fecha_dataset_lit - pl.col("hire_date")).dt.total_days() / 365.25)
           )
           .otherwise(None)
           .alias("edad_al_contratar")
     )
 
-    edad_negativa  = df.filter(pl.col("edad_al_contratar") <  0).height
-    edad_menor_18  = df.filter(
+    edad_negativa = df.filter(pl.col("edad_al_contratar") < 0).height
+    edad_menor_18 = df.filter(
         (pl.col("edad_al_contratar") >= 0) & (pl.col("edad_al_contratar") < EDAD_MINIMA_LABORAL)
     ).height
 
     if edad_negativa > 0:
         logger.warning(f"  ⚠️  {edad_negativa:,} activos con edad_al_contratar < 0 (hire_date futura)")
 
+    # 2. Ajustamos hire_date si es necesario y aseguramos que mantenga tipo pl.Date
     if edad_menor_18 > 0:
         logger.warning(f"  ⚠️  {edad_menor_18:,} activos contratados con < 18 años → ajustando hire_date")
+        
         años_faltantes = EDAD_MINIMA_LABORAL - pl.col("edad_al_contratar")
+        
         df = df.with_columns(
             pl.when(
                 pl.col("edad_al_contratar").is_not_null() &
@@ -381,6 +387,7 @@ def _etapa_8_correccion_edad_minima_laboral(df: pl.DataFrame) -> pl.DataFrame:
             )
             .then(pl.col("hire_date") + pl.duration(days=(años_faltantes * 365.25).cast(pl.Int32)))
             .otherwise(pl.col("hire_date"))
+            .cast(pl.Date)  # <-- ESTO evita que mute a Object/Float si hay nulos remanentes
             .alias("hire_date")
         )
 
@@ -394,7 +401,6 @@ def _etapa_8_correccion_edad_minima_laboral(df: pl.DataFrame) -> pl.DataFrame:
         logger.warning(f"  ⚠️  {fecha_sospechosa_count:,} hire_date ACTIVAS < 1950: revisar origen de datos")
 
     return df.drop("edad_al_contratar")
-
 
 def _etapa_9_imputacion_salary_ceros(df: pl.DataFrame) -> pl.DataFrame:
     """ETAPA 9: REGLA DE NEGOCIO – Imputación de salary == 0 (antes del análisis IQR)"""
