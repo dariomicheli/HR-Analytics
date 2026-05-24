@@ -1,920 +1,642 @@
-# ---------------------------------------------------------------------------
-# Librerias
-# ---------------------------------------------------------------------------
 from __future__ import annotations
+import logging
+import sys
+import time
+from datetime import datetime, timedelta
+import polars as pl
+
 from scripts.config import (
     EDAD_MAX,
     EDAD_MIN,
     EXP_MAX,
     RUTA_TEMP,
     STRINGS_NULOS,
-    VALOR_CENTINELA)
-import logging
-import logging.handlers
-import pandas as pd
-import numpy as np
-import re
-import sys
-from typing import Callable, Optional, Tuple
-from pathlib import Path
-from datetime import datetime
+    VALOR_CENTINELA
+)
 
 # ===========================================================================
-# CONFIGURACIÓN DE LOGGING
+# CONFIGURACIÓN Y CONSTANTES
 # ===========================================================================
 
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-def _setup_logger(
-    name: str = __name__,
-    level: int = logging.INFO,
-) -> logging.Logger:
-    """
-    Configura logger con formato estructurado y handler a consola + archivo.
-
-    Parameters
-    ----------
-    name : str
-        Nombre del logger
-    level : int
-        Nivel de logging (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-
-    Returns
-    -------
-    logging.Logger
-        Logger configurado
-    """
-    logger = logging.getLogger(name)
-    logger.setLevel(level)
-
-    # Evitar duplicación si el logger ya tiene handlers
-    if logger.handlers:
-        return logger
-
-    # Formato detallado para trazabilidad
+if not logger.handlers:
     formatter = logging.Formatter(
         fmt='[%(asctime)s] %(levelname)-8s | %(name)s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
-
-    # Handler para consola
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    return logger
 
+# 1. Constantes globales de negocio
+_PARTICULAS = {"van", "von", "de", "del", "den", "der", "da", "di", "du", "la", "le", "los", "las", "el"}
+_TITULOS = [r"Univ\.Prof\.", r"Prof\.", r"Dra\.", r"Dr\.", r"Mrs\.", r"Miss", r"Mr\.", r"Ms\.", r"Sra\.", r"Sr\.", r"Doña", r"Don", r"Ing\.", r"Lic\.", r"Arq\.", r"Tte\.", r"Gral\."]
+_GRADOS = [r"B\.Sc\.", r"M\.Sc\.", r"Ph\.D\.", r"B\.Eng\.", r"M\.Eng\.", r"B\.A\.", r"M\.A\.", r"M\.D\.", r"J\.D\.", r"MBA", r"MSc", r"BSc", r"PhD"]
 
-logger = _setup_logger(__name__)
+_PATRON_TITULOS = r"(?i)^\s*(?:" + "|".join(_TITULOS) + r")\s+"
+_PATRON_GRADOS  = r"(?i)\s+(?:" + "|".join(_GRADOS)  + r")\s*$"
 
-# ===========================================================================
-# CONSTANTES Y CONFIGURACIÓN
-# ===========================================================================
+# Constantes de negocio
+FECHA_DATASET         = datetime(2026, 3, 25).date()
+EDAD_MINIMA_LABORAL   = 18
+FECHA_SOSPECHOSA      = datetime(1950, 1, 1).date()
 
-# Importar constantes del módulo de configuración
-# En producción, descomentar y adaptar rutas según la estructura real
+# Columnas del dataset
+_COLS_CATEGORICAS_FIJAS = [
+    "department", "job_title", "status", "work_mode",
+    "country", "city", "job_level",
+]
 
-# Constantes locales del módulo
+_COLS_CATEGORICAS_EXTRA = ["performance_rating"]
+
 _COLS_TITLE_CASE = ["department", "job_title", "country", "city"]
-_COLS_TEXTO_DB = ["department", "job_title", "status", "work_mode",
-                  "country", "city", "job_level", "performance_rating"]
-_COLS_CATEGORICAS_FIJAS = ["department", "job_title",
-                           "status", "work_mode", "country", "city", "job_level"]
-_COLS_NUMERICAS = ["salary", "age", "experience_years"]
-_COLS_FECHAS = ["hire_date"]
-_COLS_IDENTIFICADORES = ["employee_id"]
+_COLS_NUMERICAS  = ["salary", "age", "experience_years"]
 
-# Títulos honoríficos y grados académicos a eliminar de nombres
-_TITULOS = [
-    r"Univ\.Prof\.", r"Prof\.", r"Dra\.", r"Dr\.",
-    r"Mrs\.", r"Miss", r"Mr\.", r"Ms\.",
-    r"Sra\.", r"Sr\.", r"Doña", r"Don",
-    r"Ing\.", r"Lic\.", r"Arq\.", r"Tte\.", r"Gral\.",
-]
-
-_GRADOS = [
-    r"B\.Sc\.", r"M\.Sc\.", r"Ph\.D\.", r"B\.Eng\.", r"M\.Eng\.",
-    r"B\.A\.", r"M\.A\.", r"M\.D\.", r"J\.D\.",
-    r"MBA", r"MSc", r"BSc", r"PhD",
-]
-
-_TITULOS_RE = re.compile(
-    r"^\s*(?:" + "|".join(_TITULOS) + r")\s+",
-    flags=re.IGNORECASE,
-)
-
-_GRADOS_RE = re.compile(
-    r"\s+(?:" + "|".join(_GRADOS) + r")\s*$",
-    flags=re.IGNORECASE,
-)
-
-# Partículas que permanecen en minúscula dentro de un nombre
-_PARTICULAS = {
-    "van", "von", "de", "del", "den", "der",
-    "da", "di", "du", "la", "le", "los", "las", "el",
-}
-
-# Valores válidos esperados en columnas categóricas
-_VALID_STATUS = {"active", "inactive",
-                 "on_leave", "terminated", VALOR_CENTINELA}
-_VALID_WORK_MODE = {"on-site", "hybrid", "remote", VALOR_CENTINELA}
-_VALID_JOB_LEVEL = {"junior", "mid", "senior",
-                    "manager", "executive", VALOR_CENTINELA}
-_VALID_PERFORMANCE = {"excellent", "good", "satisfactory",
-                      "needs improvement", f"unknown_{VALOR_CENTINELA}", VALOR_CENTINELA}
 
 # ===========================================================================
-# DECORADORES Y UTILIDADES
+# HELPERS INTERNOS
 # ===========================================================================
 
-
-def _timer_etapa(nombre_etapa: str) -> Callable:
-    """
-    Decorador que registra tiempo de ejecución de una etapa.
-
-    Parameters
-    ----------
-    nombre_etapa : str
-        Nombre descriptivo de la etapa
-
-    Returns
-    -------
-    Callable
-        Decorador funcional
-    """
-    def decorador(func: Callable) -> Callable:
-        def wrapper(*args, **kwargs):
-            inicio = datetime.now()
-            logger.info(f"▶️  Iniciando: {nombre_etapa}")
-            try:
-                resultado = func(*args, **kwargs)
-                duracion = (datetime.now() - inicio).total_seconds()
-                logger.info(f"✅ {nombre_etapa} completada en {duracion:.2f}s")
-                return resultado
-            except Exception as e:
-                duracion = (datetime.now() - inicio).total_seconds()
-                logger.error(
-                    f"❌ {nombre_etapa} falló en {duracion:.2f}s: {str(e)}")
-                raise
-        return wrapper
-    return decorador
-
-
-def _log_cambios(
-    df_antes: pd.DataFrame,
-    df_despues: pd.DataFrame,
-    etapa: str,
-    columnas_afectadas: Optional[list] = None
-) -> None:
-    """
-    Loguea cambios entre DataFrames.
-
-    Parameters
-    ----------
-    df_antes : pd.DataFrame
-        DataFrame antes de transformación
-    df_despues : pd.DataFrame
-        DataFrame después de transformación
-    etapa : str
-        Nombre de la etapa
-    columnas_afectadas : list, optional
-        Columnas que fueron modificadas
-    """
-    filas_antes = len(df_antes)
-    filas_despues = len(df_despues)
-    filas_eliminadas = filas_antes - filas_despues
-
-    logger.debug(f"  {etapa}: {filas_antes:,} → {filas_despues:,} filas " +
-                 f"({filas_eliminadas:+,})")
-
-    if columnas_afectadas:
-        logger.debug(f"  Columnas afectadas: {', '.join(columnas_afectadas)}")
-
-# ===========================================================================
-# FUNCIONES AUXILIARES - LIMPIEZA DE TEXTO
-# ===========================================================================
-
-
-def _limpiar_nombre(nombre: str) -> str:
-    """
-    Normaliza nombres personales:
-      - Elimina títulos honoríficos y grados académicos
-      - Remueve caracteres no deseados
-      - Aplica Title Case inteligente (respeta partículas)
-    """
-    if pd.isna(nombre) or not isinstance(nombre, str):
+def _aplicar_title_case_inteligente(nombre: str | None) -> str:
+    """Aplica el formateo de mayúsculas sobre texto que YA está completamente limpio."""
+    if not nombre:
         return ""
-
-    nombre = nombre.strip()
-
-    # Eliminar títulos honoríficos y grados académicos
-    nombre = _TITULOS_RE.sub("", nombre)
-    nombre = _GRADOS_RE.sub("", nombre)
-
-    # Remover caracteres especiales (mantener acentos unicode)
-    nombre = re.sub(r"[^\w\s\-\.\']", "", nombre, flags=re.UNICODE)
-
-    # Colapsar espacios múltiples
-    nombre = re.sub(r"\s+", " ", nombre).strip()
-
-    # Aplicar Title Case inteligente
     palabras = nombre.split()
     palabras_limpias = [
         palabra.lower() if i > 0 and palabra.lower() in _PARTICULAS
         else palabra.capitalize()
         for i, palabra in enumerate(palabras)
     ]
-
     return " ".join(palabras_limpias)
 
 
-def _normalizar_texto(texto: str) -> str:
+def _auditar_nulos(df: pl.DataFrame, etapa: str) -> dict[str, int]:
     """
-    Normaliza texto genérico: trim y colapso de espacios.
+    Audita nulos remanentes.
+    Devuelve el dict {col: n_nulos} para que el caller pueda decidir qué loguear.
+    Sin collect() extra – opera sobre el DataFrame ya materializado.
+    """
+    logger.info(f"📋 Auditoría [{etapa}]:")
+    resultado: dict[str, int] = {}
+    hay_nulos = False
+    for col in df.columns:
+        nulos = df[col].null_count()
+        if nulos > 0:
+            pct = (nulos / len(df)) * 100
+            logger.warning(f"  ⚠️  {col}: {nulos:,} nulos ({pct:.4f}%)")
+            resultado[col] = nulos
+            hay_nulos = True
+    if not hay_nulos:
+        logger.info("  ✅ Sin nulos")
+    return resultado
+
+
+def _nulos_a_null_polars(s: pl.Expr) -> pl.Expr:
+    """
+    reemplaza representaciones-string de nulo por null real de Polars.
 
     """
-    if not isinstance(texto, str):
-        return texto
-
-    texto = texto.strip()
-    texto = re.sub(r"\s+", " ", texto)
-    return texto
-
-# ===========================================================================
-# ETAPA 1: LIMPIEZA BÁSICA
-# ===========================================================================
-
-
-@_timer_etapa("ETAPA 1: Limpieza Básica")
-def _etapa_limpieza_basica(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Eliminación de columnas redundantes
-    Estandarización de encabezados
-    Limpieza de espacios en las columnas
-
-    """
-    # 0. Control de ingreso del df
-    if df.empty:
-        raise ValueError("❌ DataFrame vacío recibido en limpieza básica")
-
-    logger.info(f"  Input: {len(df):,} filas × {len(df.columns)} columnas")
-
-    # 1. Eliminar columnas redundantes
-    # df = df.drop(columns=["Year"], errors="ignore")
-
-    # 2. Estandarizar encabezados a snake_case
-    df.columns = (
-        df.columns
-        .str.strip()
-        .str.lower()
-        .str.replace(r"[^\w\s]", "", regex=True)
-        .str.replace(r"\s+", "_", regex=True)
+    return (
+        pl.when(s.str.to_lowercase().str.strip_chars().is_in(set(STRINGS_NULOS)))
+        .then(None)
+        .otherwise(s)
     )
-    logger.debug(
-        f"  Encabezados normalizados a snake_case: {list(df.columns)}")
 
-    # 3. Limpieza de espacios en columnas de texto
-    cols_excluir = {"employee_id", "hire_date", "salary"}
-    cols_texto = [
-        c for c in df.select_dtypes(include=["object", "string"]).columns
-        if c not in cols_excluir
-    ]
 
-    df[cols_texto] = df[cols_texto].apply(
-        lambda col: (
-            col.astype("string")
-               .str.strip()
-               .str.replace(r"\s+", " ", regex=True)
-        ),
-        axis=0
+def _timer_etapa(nombre: str, n_inicio: int | None = None):
+    """Context-manager liviano que loguea el tiempo de cada etapa."""
+    class _T:
+        def __init__(self):
+            self.t0 = time.perf_counter()
+        def __enter__(self):
+            return self
+        def __exit__(self, *_):
+            dur = time.perf_counter() - self.t0
+            extra = f" | {n_inicio:,} filas entrada" if n_inicio is not None else ""
+            logger.info(f"  ⏱  {nombre} completado en {dur:.3f}s{extra}")
+    return _T()
+
+
+# ===========================================================================
+# ETAPAS DEL PIPELINE
+# ===========================================================================
+
+def _etapa_1_limpieza_basica(q: pl.LazyFrame) -> pl.LazyFrame:
+    """ETAPA 1: Normalización de encabezados a snake_case"""
+    logger.info("▶️  ETAPA 1: Limpieza Básica")
+    import re
+
+    nuevos_nombres = {}
+    for col in q.collect_schema().names():
+        nombre_limpio = col.strip().lower()
+        nombre_limpio = re.sub(r'[^\w\s]', '', nombre_limpio)
+        nombre_limpio = re.sub(r'\s+', '_', nombre_limpio)
+        nuevos_nombres[col] = nombre_limpio
+
+    return q.rename(nuevos_nombres)
+
+
+def _etapa_2_validacion_pk(q: pl.LazyFrame) -> pl.LazyFrame:
+    """ETAPA 2: Validación de Primary Key (employee_id)"""
+    logger.info("▶️  ETAPA 2: Validación de Clave Primaria")
+    return (
+        q.drop_nulls(subset=["employee_id"])
+         .unique(subset=["employee_id"], keep="first", maintain_order=True)
+
     )
-    logger.debug(
-        f"  Limpieza de espacios en {len(cols_texto)} columnas de texto")
-
-    logger.info(f"  Output: {len(df):,} filas × {len(df.columns)} columnas")
-    return df
-
-# ===========================================================================
-# ETAPA 2: LIMPIEZA DE NOMBRES Y CLAVE PRIMARIA
-# ===========================================================================
 
 
-@_timer_etapa("ETAPA 2: Limpieza de Nombres y Validación de Claves")
-def _etapa_limpieza_claves(df: pd.DataFrame) -> pd.DataFrame:
-    """
-        Segunda etapa: limpieza de nombres propios y validación de claves primarias.
-    """
-    filas_antes = len(df)
+def _etapa_3_type_casting(q: pl.LazyFrame) -> pl.LazyFrame:
+    """ETAPA 3: Conversión de tipos de datos + aplicación de STRINGS_NULOS"""
+    logger.info("▶️  ETAPA 3: Type Casting")
 
-    # 1. Limpiar columna de nombres
-    if "full_name" in df.columns:
-        df["full_name"] = df["full_name"].astype(
-            "string").apply(_limpiar_nombre)
+    schema = q.collect_schema()
+    exprs  = []
 
-        # Eliminar filas con nombres vacíos tras limpieza
-        mask_nombres_vacios = df["full_name"].eq("")
-        n_vacios = mask_nombres_vacios.sum()
+    # Fechas
+    if "hire_date" in schema:
+        exprs.append(
+            pl.col("hire_date")
+            .cast(pl.String)
+            .str.strptime(pl.Date, format="%Y-%m-%d", strict=False)
+        )
 
-        if n_vacios > 0:
-            logger.warning(
-                f"  ⚠️  {n_vacios:,} nombres quedaron vacíos tras limpieza. Eliminando.")
-            df = df[~mask_nombres_vacios]
+    # Numéricos enteros
+    for col in ["age", "experience_years", "year"]:
+        if col in schema:
+            exprs.append(pl.col(col).cast(pl.Int32, strict=False))
 
-        logger.debug(f"  Nombres normalizados y validados")
+    # Salary
 
-    # 2. Validar clave primaria (employee_id)
-    if "employee_id" not in df.columns:
-        raise ValueError(
-            "❌ Columna 'employee_id' no encontrada. Es clave primaria requerida.")
+    if "salary" in schema:
+        exprs.append(
+            pl.col("salary")
+            .cast(pl.String)
+            .str.replace_all(",", "")
+            .str.replace_all(r"[^\d.\-]", "")   # \- escapado → solo el guion literal
+            .cast(pl.Float32, strict=False)
+            .alias("salary")
+        )
 
-    # Eliminar nulos en clave primaria
-    n_nulos_id = df["employee_id"].isna().sum()
-    if n_nulos_id > 0:
-        logger.warning(f"  ⚠️  {n_nulos_id:,} employee_id nulos. Eliminando.")
-        df = df.dropna(subset=["employee_id"])
-
-    # Eliminar duplicados (mantener primer ocurrencia)
-    n_duplicados = df["employee_id"].duplicated().sum()
-    if n_duplicados > 0:
-        logger.warning(
-            f"  ⚠️  {n_duplicados:,} employee_id duplicados. Conservando primer ocurrencia.")
-        df = df.drop_duplicates(subset=["employee_id"], keep="first")
-
-    filas_eliminadas = filas_antes - len(df)
-    if filas_eliminadas > 0:
-        logger.info(f"  Filas eliminadas por claves: {filas_eliminadas:,}")
-
-    if df.empty:
-        raise ValueError(
-            "❌ No quedan registros válidos tras validación de claves primarias")
-
-    logger.info(f"  Filas activas: {len(df):,}")
-    return df
-
-# ===========================================================================
-# ETAPA 3: TYPE CASTING Y NORMALIZACIÓN
-# ===========================================================================
+    # Categorías fijas
+    cols_cat = [c for c in _COLS_CATEGORICAS_FIJAS if c in schema]
+    if cols_cat:
+        base = (
+            pl.col(cols_cat)
+            .cast(pl.String)
+            .str.strip_chars()
+            .str.replace_all(r"\s+", " ")
+            .str.to_lowercase()
+        )
+        exprs.append(base)
 
 
-@_timer_etapa("ETAPA 3: Type Casting y Normalización")
-def _etapa_type_casting(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Tercera etapa: conversión explícita de tipos y normalización.
-    -Casteo fechas 
-    -Limpieza y casteo de salarios
-    -Casteo de columnas numericas
-    -Casteo de textos categoricos
+    if "performance_rating" in schema:
+        pr_limpio = (
+            pl.col("performance_rating")
+            .cast(pl.String)
+            .str.strip_chars()
+            .str.replace_all(r"\s+", " ")
+            .str.to_lowercase()
+        )
+        # Reemplazar representaciones-string de nulo por null real
+        exprs.append(
+            _nulos_a_null_polars(pr_limpio).alias("performance_rating")
+        )
 
-    """
+    if exprs:
+        q = q.with_columns(exprs)
 
-    # 1. Procesar fechas (hire_date)
-    if "hire_date" in df.columns:
-        try:
-            df["hire_date"] = pd.to_datetime(
-                df["hire_date"],
-                errors="coerce",
-                format="%Y-%m-%d"
+    return q
+
+
+def _etapa_4_limpieza_nombres(q: pl.LazyFrame) -> pl.LazyFrame:
+    """ETAPA 4: Limpieza de nombres optimizada y nativa en Polars"""
+    logger.info("▶️  ETAPA 4: Limpieza de Nombres (Versión Corporativa)")
+
+    if "full_name" in q.collect_schema().names():
+        q = q.with_columns(
+            pl.col("full_name")
+              .cast(pl.String)
+              .str.strip_chars()
+              .str.replace_all(_PATRON_TITULOS, "", literal=False)
+              .str.replace_all(_PATRON_GRADOS,  "", literal=False)
+              .str.replace_all(r"[^\w\s\-\.\']", "", literal=False)
+              .str.replace_all(r"\s+", " ", literal=False)
+              .str.strip_chars()
+        )
+
+        q = q.with_columns(
+            pl.col("full_name").map_elements(
+                _aplicar_title_case_inteligente, return_dtype=pl.String
             )
-            n_nats = df["hire_date"].isna().sum()
-            if n_nats > 0:
-                logger.warning(f"  ⚠️  {n_nats:,} hire_date inválidas → NaT")
-            logger.debug("  hire_date → datetime64[ns]")
-        except Exception as e:
-            logger.error(f"  ❌ Error al procesar hire_date: {str(e)}")
-            raise
-
-    # 2. Procesar salary (convertir a float limpio)
-    if "salary" in df.columns:
-        try:
-            # Si es string, eliminar caracteres no numéricos
-            if df["salary"].dtype == "object":
-                df["salary"] = (
-                    df["salary"]
-                    .astype("string")
-                    .str.replace(r"[^\d.-]", "", regex=True)
-                )
-
-            df["salary"] = pd.to_numeric(df["salary"], errors="coerce")
-
-            # Convertir a float32 para optimizar memoria
-            df["salary"] = df["salary"].astype("float32")
-
-            n_nones = df["salary"].isna().sum()
-            if n_nones > 0:
-                logger.warning(f"  ⚠️  {n_nones:,} salary inválidos → NaN")
-
-            logger.debug("  salary → float32")
-        except Exception as e:
-            logger.error(f"  ❌ Error al procesar salary: {str(e)}")
-            raise
-
-    # 3. Procesar columnas numéricas (age, experience_years)
-    for col in ["age", "experience_years"]:
-        if col in df.columns:
-            try:
-                df[col] = pd.to_numeric(
-                    df[col], errors="coerce").astype("Int32")
-                n_nones = df[col].isna().sum()
-                if n_nones > 0:
-                    logger.warning(f"  ⚠️  {n_nones:,} {col} inválidos → NA")
-                logger.debug(f"  {col} → Int32")
-            except Exception as e:
-                logger.error(f"  ❌ Error al procesar {col}: {str(e)}")
-                raise
-
-    # 4. Normalizar textos categóricos a minúsculas (para posterior validación)
-    cols_cat = [c for c in _COLS_TEXTO_DB if c in df.columns]
-    for col in cols_cat:
-        df[col] = (
-            df[col]
-            .astype("string")
-            .str.strip()
-            .str.lower()
         )
-        logger.debug(f"  {col} → string (minúsculas)")
 
-    logger.info(f"  Types casteados exitosamente")
-    return df
-
-# ===========================================================================
-# ETAPA 4: CORRECCIONES DE RANGOS NUMÉRICOS
-# ===========================================================================
-
-
-@_timer_etapa("ETAPA 4: Correcciones de Rangos Numéricos")
-def _etapa_correciones_rangos(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Cuarta etapa: detección y corrección de valores fuera de rango.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame con tipos casteados
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame con valores corregidos
-    """
-
-    # 1. Corregir salary (negativos)
-    if "salary" in df.columns:
-        mask_neg = df["salary"] < 0
-        n_neg = mask_neg.sum()
-
-        if n_neg > 0:
-            logger.warning(f"  ⚠️  {n_neg:,} salary negativos detectados")
-
-            # Estrategia: calcular rango válido por grupo (job_level × department)
-            cols_grupo = [c for c in ["job_level",
-                                      "department"] if c in df.columns]
-
-            if cols_grupo:
-                group_stats = (
-                    df[df["salary"] >= 0]
-                    .groupby(cols_grupo, observed=True)["salary"]
-                    .agg(q_min="min", q_max="max", q_median="median")
-                    .reset_index()
-                )
-
-                df_merged = df.merge(group_stats, on=cols_grupo, how="left")
-
-                # Negativos dentro del rango del grupo → abs()
-                abs_sal = df["salary"].abs()
-                in_range = mask_neg & (abs_sal >= df_merged["q_min"]) & (
-                    abs_sal <= df_merged["q_max"])
-
-                # Negativos fuera del rango → NaN
-                out_range = mask_neg & ~in_range
-
-                n_corregidos = in_range.sum()
-                n_fuera = out_range.sum()
-
-                df.loc[in_range, "salary"] = abs_sal[in_range]
-                df.loc[out_range, "salary"] = np.nan
-
-                logger.info(
-                    f"    → {n_corregidos:,} corregidos con abs() | {n_fuera:,} → NaN")
-
-    # 2. Corregir age (rango válido: EDAD_MIN - EDAD_MAX)
-    if "age" in df.columns:
-        mask_inv = (df["age"] < EDAD_MIN) | (df["age"] > EDAD_MAX)
-        n_inv = mask_inv.sum()
-
-        if n_inv > 0:
-            logger.warning(
-                f"  ⚠️  {n_inv:,} age fuera de [{EDAD_MIN}, {EDAD_MAX}] → NaN")
-            df.loc[mask_inv, "age"] = np.nan
-
-    # 3. Corregir experience_years (negativos y máximo)
-    if "experience_years" in df.columns:
-        # Negativos → abs()
-        mask_neg = df["experience_years"] < 0
-        n_neg = mask_neg.sum()
-
-        if n_neg > 0:
-            logger.warning(
-                f"  ⚠️  {n_neg:,} experience_years negativos → abs()")
-            df.loc[mask_neg, "experience_years"] = df.loc[mask_neg,
-                                                          "experience_years"].abs()
-
-        # Mayores a EXP_MAX → NaN
-        mask_max = df["experience_years"] > EXP_MAX
-        n_max = mask_max.sum()
-
-        if n_max > 0:
-            logger.warning(
-                f"  ⚠️  {n_max:,} experience_years > {EXP_MAX} → NaN")
-            df.loc[mask_max, "experience_years"] = np.nan
-
-    logger.info("  Rangos numéricos corregidos")
-    return df
-
-# ===========================================================================
-# ETAPA 5: IMPUTACIÓN DE NULOS (CATEGORÍAS)
-# ===========================================================================
-
-
-@_timer_etapa("ETAPA 5: Imputación de Nulos en Categorías")
-def _etapa_imputacion_categoricas(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Quinta etapa: tratamiento de nulos en columnas categóricas.
-    Estrategia adaptativa según % de nulos.
-
-    """
-
-    # 1. Categorías fijas: usar VALOR_CENTINELA
-    cols_fijas = [c for c in _COLS_CATEGORICAS_FIJAS if c in df.columns]
-
-    for col in cols_fijas:
-        n_nulos = df[col].isna().sum()
-
-        if n_nulos > 0:
-            pct_nulos = (n_nulos / len(df)) * 100
-            logger.debug(f"  {col}: {n_nulos:,} nulos ({pct_nulos:.2f}%)")
-
-            # Relleno simple: usar VALOR_CENTINELA
-            df[col] = df[col].fillna(VALOR_CENTINELA)
-            logger.debug(f"    → Relleno con '{VALOR_CENTINELA}'")
-
-    # 2. Performance_rating: estrategia adaptativa
-    if "performance_rating" in df.columns:
-        n_nulos = df["performance_rating"].isna().sum()
-
-        if n_nulos > 0:
-            pct_nulos = (n_nulos / len(df)) * 100
-            logger.info(
-                f"  performance_rating: {n_nulos:,} nulos ({pct_nulos:.2f}%)")
-
-            if pct_nulos < 1:
-                # Muy pocos nulos: eliminar filas
-                logger.info(f"    → < 1%: eliminando {n_nulos:,} filas")
-                df = df.dropna(subset=["performance_rating"]).copy()
-
-            elif pct_nulos < 5:
-                # Pocos nulos: imputar por moda de grupo
-                logger.info(
-                    f"    → 1-5%: imputando por moda de grupo (job_level × department)")
-
-                cols_grupo = [c for c in ["job_level",
-                                          "department"] if c in df.columns]
-
-                if cols_grupo:
-                    fallback = (
-                        df["performance_rating"].mode().iloc[0]
-                        if not df["performance_rating"].mode().empty
-                        else VALOR_CENTINELA
-                    )
-
-                    moda_grupo = df.groupby(cols_grupo, observed=True)["performance_rating"].transform(
-                        lambda x: x.mode().iloc[0] if not x.mode(
-                        ).empty else fallback
-                    )
-
-                    df["performance_rating"] = df["performance_rating"].fillna(
-                        moda_grupo)
-                else:
-                    # Sin columnas de grupo, usar moda global
-                    moda_global = (
-                        df["performance_rating"].mode().iloc[0]
-                        if not df["performance_rating"].mode().empty
-                        else VALOR_CENTINELA
-                    )
-                    df["performance_rating"] = df["performance_rating"].fillna(
-                        moda_global)
-
-            else:
-                # Muchos nulos: usar centinela
-                logger.warning(
-                    f"    → ≥ 5%: usando centinela '{VALOR_CENTINELA}'")
-                df["performance_rating"] = df["performance_rating"].fillna(
-                    f"unknown_{VALOR_CENTINELA}")
-
-    logger.info("  Categorías imputadas")
-    return df
-
-# ===========================================================================
-# ETAPA 6: IMPUTACIÓN DE NULOS (NUMÉRICAS)
-# ===========================================================================
-
-
-@_timer_etapa("ETAPA 6: Imputación de Nulos en Numéricas")
-def _etapa_imputacion_numericas(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Sexta etapa: imputación de nulos en columnas numéricas.
-    Estrategia: mediana por grupo, fallback a mediana global.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame con nulos categóricos tratados
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame sin nulos en numéricas (imputadas)
-    """
-
-    cols_numericas = [c for c in _COLS_NUMERICAS if c in df.columns]
-
-    for col in cols_numericas:
-        n_nulos = df[col].isna().sum()
-
-        if n_nulos > 0:
-            pct_nulos = (n_nulos / len(df)) * 100
-            logger.info(f"  {col}: {n_nulos:,} nulos ({pct_nulos:.2f}%)")
-
-            # Intentar imputar por grupo (si existen columnas de agrupación)
-            cols_grupo = [c for c in ["job_level",
-                                      "department"] if c in df.columns]
-
-            if cols_grupo and len(df) > 1:
-                mediana_grupo = df.groupby(cols_grupo, observed=True)[
-                    col].transform("median")
-                df[col] = df[col].fillna(mediana_grupo)
-                n_nulos_post_grupo = df[col].isna().sum()
-                logger.debug(
-                    f"    → Imputación por grupo: {n_nulos - n_nulos_post_grupo:,} valores")
-
-                if n_nulos_post_grupo > 0:
-                    # Fallback a mediana global
-                    mediana_global = df[col].median()
-                    if pd.notna(mediana_global):
-                        df[col] = df[col].fillna(mediana_global)
-                        logger.debug(
-                            f"    → Fallback global: {n_nulos_post_grupo:,} valores")
-            else:
-                # Sin grupos: mediana global directa
-                mediana_global = df[col].median()
-                if pd.notna(mediana_global):
-                    df[col] = df[col].fillna(mediana_global)
-                    logger.debug(f"    → Mediana global: {n_nulos:,} valores")
-
-    logger.info("  Numéricas imputadas")
-    return df
-
-# ===========================================================================
-# ETAPA 7: VALIDACIONES DE CONSISTENCIA
-# ===========================================================================
-
-
-@_timer_etapa("ETAPA 7: Validaciones de Consistencia Cruzada")
-def _etapa_validaciones_cruzadas(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Séptima etapa: validaciones lógicas entre columnas relacionadas.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame con nulos tratados
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame validado (con warnings si hay inconsistencias)
-    """
-
-    # 1. Validar experience_years vs age
-    if "experience_years" in df.columns and "age" in df.columns:
-        # Experiencia no puede ser mayor que edad - 16 (edad mínima laboral hipotética)
-        mask_inconsistente = df["experience_years"] > (df["age"] - 16)
-        n_inconsistentes = mask_inconsistente.sum()
-
-        if n_inconsistentes > 0:
-            logger.warning(
-                f"  ⚠️  {n_inconsistentes:,} registros: experience_years > (age - 16)")
-            logger.debug(
-                "    Consejo: Revisar datos de origen para empleados antiguos")
-
-    # 2. Validar salary > 0
-    if "salary" in df.columns:
-        mask_cero = df["salary"] == 0
-        n_cero = mask_cero.sum()
-
-        if n_cero > 0:
-            logger.warning(f"  ⚠️  {n_cero:,} registros con salary = 0")
-
-    # 3. Validar hire_date ≤ fecha actual
-    if "hire_date" in df.columns:
-        fecha_actual = pd.Timestamp.now()
-        mask_futura = df["hire_date"] > fecha_actual
-        n_futura = mask_futura.sum()
-
-        if n_futura > 0:
-            logger.warning(f"  ⚠️  {n_futura:,} hire_date en el futuro")
-
-    # 4. Validar status válido
-    if "status" in df.columns:
-        status_invalidos = ~df["status"].isin(_VALID_STATUS)
-        n_invalidos = status_invalidos.sum()
-
-        if n_invalidos > 0:
-            valores_invalidos = df[status_invalidos]["status"].unique()
-            logger.warning(
-                f"  ⚠️  {n_invalidos:,} status inválidos: {set(valores_invalidos)}")
-
-    # 5. Validar work_mode válido
-    if "work_mode" in df.columns:
-        work_mode_invalidos = ~df["work_mode"].isin(_VALID_WORK_MODE)
-        n_invalidos = work_mode_invalidos.sum()
-
-        if n_invalidos > 0:
-            valores_invalidos = df[work_mode_invalidos]["work_mode"].unique()
-            logger.warning(
-                f"  ⚠️  {n_invalidos:,} work_mode inválidos: {set(valores_invalidos)}")
-
-    # 6. Validar job_level válido
-    if "job_level" in df.columns:
-        job_level_invalidos = ~df["job_level"].isin(_VALID_JOB_LEVEL)
-        n_invalidos = job_level_invalidos.sum()
-
-        if n_invalidos > 0:
-            valores_invalidos = df[job_level_invalidos]["job_level"].unique()
-            logger.warning(
-                f"  ⚠️  {n_invalidos:,} job_level inválidos: {set(valores_invalidos)}")
-
-    logger.info("  Validaciones cruzadas completadas")
-    return df
-
-# ===========================================================================
-# ETAPA 8: NORMALIZACIÓN FINAL (TITLE CASE Y FORMAT)
-# ===========================================================================
-
-
-@_timer_etapa("ETAPA 8: Normalización Final de Formato")
-def _etapa_normalizacion_final(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Octava etapa: aplicación de Title Case en campos semánticos.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame validado
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame con formato final normalizado
-    """
-
-    # Aplicar Title Case en columnas específicas
-    cols_title = [c for c in _COLS_TITLE_CASE if c in df.columns]
-
-    for col in cols_title:
-        # Title case aplicado (convertir a string primero)
-        df[col] = df[col].astype("string").str.title()
-        logger.debug(f"  {col} → Title Case")
-
-    # Aplicar Title Case especial para performance_rating (si existe)
-    if "performance_rating" in df.columns:
-        df["performance_rating"] = (
-            df["performance_rating"]
-            .astype("string")
-            .str.replace("_", " ")
-            .str.title()
+        q = q.filter(
+            pl.col("full_name").is_not_null() & (pl.col("full_name").str.len_chars() > 0)
         )
-        logger.debug("  performance_rating → Title Case")
 
-    logger.info("  Formatos finales normalizados")
-    return df
-
-# ===========================================================================
-# ETAPA 9: REPORTE FINAL Y VALIDACIÓN
-# ===========================================================================
+    return q
 
 
-def _etapa_reporte_final(
-    df: pd.DataFrame,
-    df_original: pd.DataFrame
-) -> None:
-    """
-    Novena etapa: generación de reporte final de calidad.
+def _etapa_5_correccion_rangos(q: pl.LazyFrame) -> pl.LazyFrame:
+    """ETAPA 5: Corrección de rangos numéricos"""
+    logger.info("▶️  ETAPA 5: Corrección de Rangos")
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        DataFrame procesado
-    df_original : pd.DataFrame
-        DataFrame original (para comparación)
-    """
+    columnas_disponibles = q.collect_schema().names()
+    cols_grupo = [c for c in ["job_level", "department"] if c in columnas_disponibles]
 
-    logger.info("=" * 70)
-    logger.info("🎯 REPORTE FINAL DEL PIPELINE")
-    logger.info("=" * 70)
+    if cols_grupo:
+        salarios_validos = pl.when(pl.col("salary") >= 0).then(pl.col("salary")).otherwise(None)
+        q_min = salarios_validos.min().over(cols_grupo)
+        q_max = salarios_validos.max().over(cols_grupo)
 
-    # Estadísticas globales
-    logger.info(f"Filas procesadas:")
-    logger.info(f"  Entrada:  {len(df_original):,}")
-    logger.info(f"  Salida:   {len(df):,}")
-    logger.info(
-        f"  Cambio:   {len(df) - len(df_original):+,} ({((len(df) - len(df_original)) / len(df_original) * 100):.2f}%)")
-
-    logger.info(f"\nColumnas procesadas:")
-    logger.info(f"  Total: {len(df.columns)}")
-    logger.info(f"  Nombres: {list(df.columns)}")
-
-    # Nulos remanentes
-    logger.info(f"\nNulos remanentes:")
-    nulos_remanentes = df.isna().sum()
-    nulos_remanentes = nulos_remanentes[nulos_remanentes > 0]
-
-    if nulos_remanentes.empty:
-        logger.info("  ✅ Ninguno (completamente limpio)")
+        expr_salary = (
+            pl.when((pl.col("salary") < 0) & (pl.col("salary").abs() >= q_min) & (pl.col("salary").abs() <= q_max))
+            .then(pl.col("salary").abs())
+            .when(pl.col("salary") < 0)
+            .then(None)
+            .otherwise(pl.col("salary"))
+            .alias("salary")
+        )
     else:
-        for col, n in nulos_remanentes.items():
-            pct = (n / len(df)) * 100
-            logger.info(f"  {col}: {n:,} ({pct:.2f}%) - INTENCIONAL")
+        expr_salary = (
+            pl.when(pl.col("salary") < 0)
+            .then(None)
+            .otherwise(pl.col("salary"))
+            .alias("salary")
+        )
 
-    # Tipos de datos
-    logger.info(f"\nTipos de datos finales:")
-    for col, dtype in df.dtypes.items():
-        logger.info(f"  {col}: {dtype}")
+    q = q.with_columns([
+        expr_salary,
+        pl.when((pl.col("age") < EDAD_MIN) | (pl.col("age") > EDAD_MAX))
+        .then(None)
+        .otherwise(pl.col("age"))
+        .alias("age"),
+        pl.col("experience_years").abs().alias("experience_years"),
+    ]).with_columns([
+        pl.when(pl.col("experience_years") > EXP_MAX)
+        .then(None)
+        .otherwise(pl.col("experience_years"))
+        .alias("experience_years"),
+    ])
 
-    logger.info("=" * 70)
-    logger.info("✅ Pipeline completado exitosamente")
-    logger.info("=" * 70)
+    return q
+
+
+def _etapa_6_validacion_cruzada(q: pl.LazyFrame) -> pl.LazyFrame:
+    """ETAPA 6: Validaciones lógicas cruzadas"""
+    logger.info("▶️  ETAPA 6: Validación Cruzada")
+
+    # Experience no puede superar age - 16.
+    # Si age es null la condición evalúa null → se conserva el valor original. ✅
+    q = q.with_columns(
+        pl.when(pl.col("experience_years") > (pl.col("age") - 16))
+        .then(pl.col("age") - 16)
+        .otherwise(pl.col("experience_years"))
+        .alias("experience_years")
+    )
+
+    fecha_hoy = pl.lit(FECHA_DATASET)
+    q = q.with_columns(
+        pl.when(pl.col("hire_date") > fecha_hoy)
+        .then(None)
+        .otherwise(pl.col("hire_date"))
+        .alias("hire_date")
+    )
+
+    return q
+
+
+def _etapa_7_imputacion_nulos(q: pl.LazyFrame) -> pl.LazyFrame:
+    """ETAPA 7: Imputación de nulos (previo a etapas 8-11)"""
+    logger.info("▶️  ETAPA 7: Imputación de Nulos Básicos")
+
+    q = q.with_columns([
+        pl.col("salary")
+          .fill_null(pl.col("salary").median().over(["job_level", "department"])),
+        pl.col("age")
+          .fill_null(pl.col("age").median().over(["job_level", "department"])),
+        pl.col("experience_years")
+          .fill_null(pl.col("experience_years").median().over(["job_level", "department"])),
+        pl.col(_COLS_CATEGORICAS_FIJAS).fill_null(VALOR_CENTINELA),
+        # performance_rating NO recibe centinela aquí; su lógica adaptativa
+        # es responsabilidad exclusiva de etapa 10.
+    ]).with_columns([
+        # Fallback global para los grupos que no tienen ningún valor válido
+        pl.col("salary").fill_null(pl.col("salary").median()),
+        pl.col("age")
+          .fill_null(pl.col("age").median()).round(0).cast(pl.Int32),
+        pl.col("experience_years")
+          .fill_null(pl.col("experience_years").median()).round(0).cast(pl.Int32),
+    ])
+
+    # hire_date: no hay imputación determinística segura; se deja como null
+    # para que etapa 8 la gestione junto con la validación de edad mínima.
+
+    return q
+
+
+def _etapa_8_correccion_edad_minima_laboral(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    ETAPA 8: REGLA DE NEGOCIO – Corrección de hire_date por edad mínima laboral.
+    SOLO APLICA A EMPLEADOS ACTIVOS.
+    """
+    logger.info("▶️  ETAPA 8: Corrección por Edad Mínima Laboral (SOLO ACTIVOS)")
+
+    es_activo_con_datos = (
+        (pl.col("status") == "active") &    # normalizado en etapa 3
+        (pl.col("hire_date").is_not_null()) &
+        (pl.col("age").is_not_null())
+    )
+
+    df = df.with_columns(
+        pl.when(es_activo_con_datos)
+          .then(
+              pl.col("age") - ((FECHA_DATASET - pl.col("hire_date")).dt.total_days() / 365.25)
+          )
+          .otherwise(None)
+          .alias("edad_al_contratar")
+    )
+
+    edad_negativa  = df.filter(pl.col("edad_al_contratar") <  0).height
+    edad_menor_18  = df.filter(
+        (pl.col("edad_al_contratar") >= 0) & (pl.col("edad_al_contratar") < EDAD_MINIMA_LABORAL)
+    ).height
+
+    if edad_negativa > 0:
+        logger.warning(f"  ⚠️  {edad_negativa:,} activos con edad_al_contratar < 0 (hire_date futura)")
+
+    if edad_menor_18 > 0:
+        logger.warning(f"  ⚠️  {edad_menor_18:,} activos contratados con < 18 años → ajustando hire_date")
+        años_faltantes = EDAD_MINIMA_LABORAL - pl.col("edad_al_contratar")
+        df = df.with_columns(
+            pl.when(
+                pl.col("edad_al_contratar").is_not_null() &
+                (pl.col("edad_al_contratar") < EDAD_MINIMA_LABORAL) &
+                (pl.col("edad_al_contratar") >= 0)
+            )
+            .then(pl.col("hire_date") + pl.duration(days=(años_faltantes * 365.25).cast(pl.Int32)))
+            .otherwise(pl.col("hire_date"))
+            .alias("hire_date")
+        )
+
+    fecha_sospechosa_count = df.filter(
+        (pl.col("status") == "active") &
+        (pl.col("hire_date").is_not_null()) &
+        (pl.col("hire_date") < FECHA_SOSPECHOSA)
+    ).height
+
+    if fecha_sospechosa_count > 0:
+        logger.warning(f"  ⚠️  {fecha_sospechosa_count:,} hire_date ACTIVAS < 1950: revisar origen de datos")
+
+    return df.drop("edad_al_contratar")
+
+
+def _etapa_9_imputacion_salary_ceros(df: pl.DataFrame) -> pl.DataFrame:
+    """ETAPA 9: REGLA DE NEGOCIO – Imputación de salary == 0 (antes del análisis IQR)"""
+    logger.info("▶️  ETAPA 9: Imputación de Salary == 0")
+
+    salarios_cero = df.filter(pl.col("salary") == 0).height
+
+    if salarios_cero > 0:
+        logger.warning(f"  ⚠️  {salarios_cero:,} salarios == 0 detectados → imputando")
+
+        mediana_global = df.filter(pl.col("salary") > 0)["salary"].median()
+        mediana_grupo  = (
+            pl.col("salary").filter(pl.col("salary") > 0)
+            .median().over(["job_level", "department"])
+        )
+
+        df = df.with_columns(
+            pl.when(pl.col("salary") == 0)
+              .then(mediana_grupo.fill_null(mediana_global))
+              .otherwise(pl.col("salary"))
+              .alias("salary")
+        )
+        logger.info(f"    → Mediana global (excluyendo ceros): ${mediana_global:,.2f}")
+
+    # Análisis IQR post-imputación (sin collect extra)
+    if len(df) > 0:
+        q1  = df["salary"].quantile(0.25)
+        q3  = df["salary"].quantile(0.75)
+        iqr = q3 - q1
+        lim_inf = q1 - 1.5 * iqr
+        lim_sup = q3 + 1.5 * iqr
+
+        outliers = df.filter(
+            (pl.col("salary") < lim_inf) | (pl.col("salary") > lim_sup)
+        ).height
+
+        pct_out = (outliers / len(df)) * 100
+        logger.info(
+            f"  Outliers salary (post-imputación): {outliers:,} ({pct_out:.4f}%) "
+            f"| Rango IQR: [${lim_inf:,.0f} – ${lim_sup:,.0f}]"
+        )
+
+    return df
+
+
+def _etapa_10_performance_rating_adaptativo(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    ETAPA 10: Tratamiento adaptativo de performance_rating.
+
+    """
+    logger.info("▶️  ETAPA 10: Imputación Adaptativa de Performance_Rating")
+
+    if "performance_rating" not in df.columns:
+        return df
+
+    # Segunda línea de defensa: normalizar y re-aplicar STRINGS_NULOS
+    # sobre cualquier residuo que etapa 3 no haya visto.
+    df = df.with_columns(
+        pl.when(
+            pl.col("performance_rating")
+              .cast(pl.String)
+              .str.to_lowercase()
+              .str.strip_chars()
+              .is_in(set(STRINGS_NULOS) | {""})
+        )
+        .then(None)
+        .otherwise(pl.col("performance_rating").cast(pl.String).str.to_lowercase().str.strip_chars())
+        .alias("performance_rating")
+    )
+
+    nulos_perf = df["performance_rating"].null_count()
+    total      = len(df)
+
+    if nulos_perf == 0:
+        logger.info("  ✅ Sin nulos en performance_rating")
+        return df
+
+    pct_nulos = (nulos_perf / total) * 100
+    logger.info(f"  performance_rating: {nulos_perf:,} nulos ({pct_nulos:.4f}%)")
+
+    if pct_nulos < 0.5:
+        logger.info(f"    → < 0.5%: eliminando {nulos_perf:,} filas")
+        df = df.drop_nulls(subset=["performance_rating"])
+
+    elif pct_nulos < 3:
+        logger.info(f"    → 0.5–3%: imputando por moda de grupo (job_level × department)")
+
+        perf_moda = (
+            df.group_by(["job_level", "department"])
+              .agg(
+                  pl.col("performance_rating")
+                    .drop_nulls()
+                    .mode()
+                    .first()
+                    .alias("perf_mode")
+              )
+        )
+
+        df = (
+            df.join(perf_moda, on=["job_level", "department"], how="left")
+              .with_columns(
+                  pl.col("performance_rating")
+                    .fill_null(pl.col("perf_mode"))
+                    .fill_null(VALOR_CENTINELA)
+              )
+              .drop("perf_mode")
+        )
+
+    else:
+        logger.error(f"    ❌ ≥ 3%: DEMASIADOS NULOS ({pct_nulos:.2f}%)")
+        logger.error("    → ACCIÓN REQUERIDA: Revisar proceso de extracción de performance_rating")
+        df = df.with_columns(
+            pl.col("performance_rating").fill_null(f"unknown_{VALOR_CENTINELA}")
+        )
+
+    return df
+
+
+def _etapa_11_normalizacion_final(df: pl.DataFrame) -> pl.DataFrame:
+    """ETAPA 11: Normalización estética final (Title Case)"""
+    logger.info("▶️  ETAPA 11: Normalización Final")
+
+    for col in _COLS_TITLE_CASE:
+        if col in df.columns:
+            df = df.with_columns(pl.col(col).cast(pl.String).str.to_titlecase())
+
+    if "performance_rating" in df.columns:
+        df = df.with_columns(
+            pl.col("performance_rating")
+              .str.replace_all("_", " ")
+              .str.to_titlecase()
+        )
+
+    return df
+
 
 # ===========================================================================
-# FUNCIÓN PRINCIPAL DEL PIPELINE
+# FUNCIÓN PRINCIPAL PARA AIRFLOW
 # ===========================================================================
-
 
 def clean_data(**context) -> str:
     """
-    PIPELINE COMPLETO DE LIMPIEZA Y TRANSFORMACIÓN DE DATOS
+    Pipeline completo de limpieza y transformación de datos HR en Polars.
 
-    Ejecuta el proceso ETL completo en 9 etapas:
-
-    1. Limpieza Básica: encabezados, espacios, columnas redundantes
-    2. Limpieza de Nombres: normalización de nombres propios y claves
-    3. Type Casting: conversión consistente de tipos
-    4. Correcciones de Rangos: validación de valores numéricos
-    5. Imputación Categóricas: tratamiento de nulos en categorías
-    6. Imputación Numéricas: completado de valores faltantes
-    7. Validaciones Cruzadas: verificación de consistencia lógica
-    8. Normalización Final: format final de presentación
-    9. Reporte Final: generación de métricas de calidad
 
     """
 
+    t_pipeline = time.perf_counter()
+
     logger.info("╔" + "=" * 68 + "╗")
-    logger.info("║" + " INICIANDO PIPELINE: clean_transform ".center(68) + "║")
+    logger.info("║" + " PIPELINE: clean_transform ".center(68) + "║")
+    logger.info("║" + " 11 ETAPAS + REGLAS DE NEGOCIO ".center(68)          + "║")
     logger.info("╚" + "=" * 68 + "╝")
 
     ti = context.get("ti")
     if ti is None:
-        raise ValueError("No TaskInstance (ti) en contexto Airflow")
+        raise ValueError("❌ No TaskInstance (ti) en contexto Airflow")
 
     extract_filepath = ti.xcom_pull(task_ids="extract_csv")
 
-    # Cargar el DataFrame desde el archivo Parquet extraído
-    df = pd.read_parquet(extract_filepath, engine='pyarrow')  # type: ignore
+    # ── Carga perezosa ─────────────────────────────────────────────────────
+    q = pl.scan_parquet(extract_filepath)
+    n_original = q.select(pl.len()).collect()[0, 0]
+    logger.info(f"\n📊 Filas en dataset entrada: {n_original:,}")
 
-    try:
-        # Guardar DataFrame original para comparación
-        df_original = df.copy()
+    # ── Etapas lazy (1-7) ──────────────────────────────────────────────────
+    etapas_lazy = [
+        ("Etapa 1 – snake_case",       _etapa_1_limpieza_basica),
+        ("Etapa 2 – PK",               _etapa_2_validacion_pk),
+        ("Etapa 3 – type casting",     _etapa_3_type_casting),
+        ("Etapa 4 – nombres",          _etapa_4_limpieza_nombres),
+        ("Etapa 5 – rangos",           _etapa_5_correccion_rangos),
+        ("Etapa 6 – validación cruzada", _etapa_6_validacion_cruzada),
+        ("Etapa 7 – imputación nulos", _etapa_7_imputacion_nulos),
+    ]
+    for label, fn in etapas_lazy:
+        t0 = time.perf_counter()
+        q = fn(q)
+        logger.info(f"  ⏱  {label} encolado en {time.perf_counter() - t0:.4f}s")
 
-        # ETAPAS DEL PIPELINE (secuencial)
-        df = _etapa_limpieza_basica(df)
-        df = _etapa_limpieza_claves(df)
-        df = _etapa_type_casting(df)
-        df = _etapa_correciones_rangos(df)
-        df = _etapa_imputacion_categoricas(df)
-        df = _etapa_imputacion_numericas(df)
-        df = _etapa_validaciones_cruzadas(df)
-        df = _etapa_normalizacion_final(df)
+    # ── Materialización ────────────────────────────────────────────────────
+    logger.info("\n⚙️  Materializando datos (etapas 8-11 requieren datos en memoria)…")
+    t0 = time.perf_counter()
+    df = q.collect()
+    n_post_lazy = len(df)
+    logger.info(
+        f"  ⏱  Collect completado en {time.perf_counter() - t0:.3f}s "
+        f"| Δ filas: {n_post_lazy - n_original:+,} "
+        f"({(n_post_lazy - n_original) / n_original * 100:+.2f}%)"
+    )
+    _auditar_nulos(df, "Post-Etapa 7")
 
-        # REPORTE FINAL
-        _etapa_reporte_final(df, df_original)
+    # ── Etapas eager (8-11) ────────────────────────────────────────────────
+    etapas_eager = [
+        ("Etapa 8  – edad mínima laboral",   _etapa_8_correccion_edad_minima_laboral),
+        ("Etapa 9  – salary ceros/IQR",      _etapa_9_imputacion_salary_ceros),
+        ("Etapa 10 – performance_rating",    _etapa_10_performance_rating_adaptativo),
+        ("Etapa 11 – normalización final",   _etapa_11_normalizacion_final),
+    ]
+    for label, fn in etapas_eager:
+        t0     = time.perf_counter()
+        n_prev = len(df)
+        df     = fn(df)
+        delta  = len(df) - n_prev
+        logger.info(
+            f"  ⏱  {label}: {time.perf_counter() - t0:.3f}s "
+            f"| Δ filas esta etapa: {delta:+,}"
+        )
 
-        # Reset de índices para limpieza final
-        df = df.reset_index(drop=True)
+    # ── Reporte final ──────────────────────────────────────────────────────
+    t_total = time.perf_counter() - t_pipeline
+    logger.info("\n" + "=" * 70)
+    logger.info("🎯 REPORTE FINAL DEL PIPELINE")
+    logger.info("=" * 70)
+    logger.info(f"  ⏱  Tiempo total pipeline:  {t_total:.2f}s")
+    logger.info(f"  Filas entrada:             {n_original:,}")
+    logger.info(f"  Filas post-lazy (etapas 1-7): {n_post_lazy:,} ({n_post_lazy - n_original:+,})")
+    logger.info(f"  Filas salida final:        {len(df):,} ({len(df) - n_original:+,} total, {(len(df) - n_original) / n_original * 100:+.2f}%)")
 
-        ruta_destino = f"{RUTA_TEMP}/clean.parquet"
-        df.to_parquet(ruta_destino, engine='pyarrow', index=False)
+    logger.info("\n  Tipos finales:")
+    for col, dtype in zip(df.columns, df.dtypes):
+        logger.info(f"    {col:<28} {dtype}")
 
-        return ruta_destino
+    logger.info("\n  Nulos residuales:")
+    nulos_finales = {c: df[c].null_count() for c in df.columns if df[c].null_count() > 0}
+    if nulos_finales:
+        logger.warning(f"    ⚠️  {len(nulos_finales)} columnas con nulos remanentes:")
+        for col, n in nulos_finales.items():
+            pct = n / len(df) * 100
+            logger.warning(f"      {col:<28} {n:>8,}  ({pct:.4f}%)")
+    else:
+        logger.info("    ✅ Dataset completamente limpio – sin nulos")
 
-    except Exception as e:
-        logger.critical(f"❌ PIPELINE FALLIDO: {str(e)}")
-        logger.critical("Traceback:", exc_info=True)
-        raise
+    logger.info("=" * 70)
+
+    # ── Persistencia ───────────────────────────────────────────────────────
+    ruta_destino = f"{RUTA_TEMP}/clean.parquet"
+    t0 = time.perf_counter()
+    df.write_parquet(ruta_destino)
+    logger.info(
+        f"✅ Pipeline completado. Guardado en: {ruta_destino} "
+        f"({time.perf_counter() - t0:.3f}s)"
+    )
+
+    return ruta_destino

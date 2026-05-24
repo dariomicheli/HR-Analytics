@@ -4,7 +4,7 @@ from scripts.config import RUTA_INPUT
 from scripts.discover import discover_input_file
 from scripts.validate_schema import validate_schema
 from scripts.load import load_data_postgres
-from scripts.clean_transform_polars import clean_data
+from scripts.clean_transform import clean_data
 from scripts.extract import extract_csv
 from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.operators.python import PythonOperator
