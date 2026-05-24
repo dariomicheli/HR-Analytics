@@ -5,7 +5,6 @@ import re
 import sys
 from datetime import datetime
 import polars as pl
-import logging
 
 from scripts.config import (
     EDAD_MAX,
@@ -80,25 +79,17 @@ _PARTICULAS = {
 
 def _limpiar_nombre_exacto(nombre: str) -> str:
     """
-      - Elimina títulos honoríficos y grados académicos
-      - Remueve caracteres no deseados
-      - Aplica Title Case inteligente (respeta partículas)
+    Normaliza nombres personales respetando la lógica original de partículas.
     """
     if not nombre or not isinstance(nombre, str):
         return ""
 
     nombre = nombre.strip()
-    # Eliminar títulos honoríficos y grados académicos
     nombre = _TITULOS_RE.sub("", nombre)
     nombre = _GRADOS_RE.sub("", nombre)
-
-    # Remover caracteres especiales (mantener acentos unicode)
     nombre = re.sub(r"[^\w\s\-\.\']", "", nombre, flags=re.UNICODE)
-
-    # Colapsar espacios múltiples
     nombre = re.sub(r"\s+", " ", nombre).strip()
 
-# Aplicar Title Case inteligente
     palabras = nombre.split()
     palabras_limpias = [
         palabra.lower() if i > 0 and palabra.lower() in _PARTICULAS
@@ -107,20 +98,6 @@ def _limpiar_nombre_exacto(nombre: str) -> str:
     ]
 
     return " ".join(palabras_limpias)
-
-def _to_snake_case(name: str) -> str:
-    """
-    Estandariza un texto a snake_case imitando el comportamiento de Pandas:
-    Elimina caracteres especiales y colapsa múltiples espacios en guiones bajos.
-    """
-    if not name:
-        return ""
-    # 1. Quitar espacios en los extremos y pasar a minúsculas
-    name = name.strip().lower()
-    # 2. Eliminar caracteres que no sean letras, números o espacios (Ej: corregir "salary ($)" -> "salary ")
-    name = re.sub(r"[^\w\s]", "", name)
-    # 3. Cambiar uno o más espacios seguidos por un único guion bajo (Ej: "job   title" -> "job_title")
-    return re.sub(r"\s+", "_", name)
 
 # ===========================================================================
 # FUNCIÓN PRINCIPAL DEL PIPELINE
@@ -139,17 +116,16 @@ def clean_data(**context) -> str:
 
     extract_filepath = ti.xcom_pull(task_ids="extract_csv")
 
-    # 1. Inicio de contexto Lazy 
+    # 1. Inicio de contexto Lazy (No consume RAM)
     q = pl.scan_parquet(extract_filepath)
 
-    # 2. Estandarizar encabezados a snake_case 
+    # 2. Estandarizar encabezados a snake_case sin disparar Alertas de Performance
     q = q.rename({
-            col: _to_snake_case(col) 
-            for col in q.collect_schema().names()
-        })
+        col: col.strip().lower().replace(" ", "_")
+        for col in q.collect_schema().names()
+    })
 
-    # 3. Validación de clave primaria (employee_id) 
-    # Elimino nulos y duplicados, conservo el primero
+    # 3. Validación de clave primaria (employee_id)
     q = q.drop_nulls(subset=["employee_id"]).unique(
         subset=["employee_id"], keep="first")
 
@@ -171,18 +147,11 @@ def clean_data(**context) -> str:
             _limpiar_nombre_exacto, return_dtype=pl.String)
     ).filter(pl.col("full_name") != "")
 
-   # 6. Corrección de Rangos Numéricos usando Window Functions (.over)
+    # 6. Corrección de Rangos Numéricos usando Window Functions (.over)
     q = q.with_columns([
-        pl.when(pl.col("salary") >= 0)
-          .then(pl.col("salary"))
-          .otherwise(None)
-          .min().over(["job_level", "department"]).alias("q_min"),
-
-        pl.when(pl.col("salary") >= 0)
-          .then(pl.col("salary"))
-          .otherwise(None)
-          .max().over(["job_level", "department"]).alias("q_max"),
-
+        pl.col("salary").min().over(
+            ["job_level", "department"]).alias("q_min"),
+        pl.col("salary").max().over(["job_level", "department"]).alias("q_max")
     ]).with_columns([
         pl.when((pl.col("salary") < 0) &
                 (pl.col("salary").abs() >= pl.col("q_min")) &
@@ -191,15 +160,13 @@ def clean_data(**context) -> str:
           .when(pl.col("salary") < 0).then(None)
           .otherwise(pl.col("salary")).alias("salary"),
 
-        pl.when((pl.col("age") < EDAD_MIN) | (pl.col("age") > EDAD_MAX))
-          .then(None)
-          .otherwise(pl.col("age")).alias("age"),
+        pl.when((pl.col("age") < EDAD_MIN) | (pl.col("age") > EDAD_MAX)).then(
+            None).otherwise(pl.col("age")).alias("age"),
 
-        pl.when(pl.col("experience_years") < 0)
-          .then(pl.col("experience_years").abs())
+        pl.when(pl.col("experience_years") < 0).then(
+            pl.col("experience_years").abs())
           .when(pl.col("experience_years") > EXP_MAX).then(None)
           .otherwise(pl.col("experience_years")).alias("experience_years")
-
     ]).drop(["q_min", "q_max"])
 
     # 7. Imputación de Numéricas y Categorías Fijas por Mediana
@@ -284,6 +251,7 @@ def clean_data(**context) -> str:
     # Guardado físico final
     ruta_destino = f"{RUTA_TEMP}/clean.parquet"
     df.write_parquet(ruta_destino)
+
     logger.info("=" * 70)
     logger.info("🎯 REPORTE FINAL DEL PIPELINE (POLARS MIGRATION)")
     logger.info("=" * 70)
