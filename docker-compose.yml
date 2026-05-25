@@ -155,6 +155,8 @@ services:
       POSTGRES_DB: metabase
     volumes:
       - postgres_metabase_data:/var/lib/postgresql/data
+      # CAMBIO ACÁ: Vincula el init_metabase.sql a la carpeta de inicialización interna de Postgres
+      - ./sql/init_metabase.sql:/docker-entrypoint-initdb.d/01_init_metabase.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U metabase"]
       interval: 5s
