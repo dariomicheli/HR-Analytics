@@ -1,3 +1,4 @@
+from dags.scripts.quality_checks import quality_checks
 from scripts.build_aggregations import refresh_materialized_views
 from scripts.archive import archive_file
 from scripts.config import RUTA_INPUT
@@ -39,7 +40,8 @@ with DAG(
         filepath=f"{RUTA_INPUT}*.csv",
         poke_interval=60,  # Revisa cada 60 segundos
         mode="reschedule"
-    )
+    ) 
+    #se cambia por la ingesta
 
     # Descubre la ruta del archivo CSV recién llegado
     tarea_descubrir = PythonOperator(
@@ -70,6 +72,11 @@ with DAG(
         task_id="load_data_postgres",
         python_callable=load_data_postgres,
     )
+    # Quality Checks post-carga
+    tarea_quality_checks = PythonOperator(
+        task_id="quality_checks",
+        python_callable=quality_checks,
+    )
 
     tarea_actualizar_vm = PythonOperator(
         task_id="refresh_materialized_views",
@@ -82,4 +89,4 @@ with DAG(
     )
 
     # Definimos el orden estricto de ejecución (El Pipeline)
-    tarea_esperar >> tarea_descubrir >> tarea_validar >> tarea_extraer >> tarea_transformar >> tarea_cargar >> tarea_actualizar_vm >> tarea_archivar
+    tarea_esperar >> tarea_descubrir >> tarea_validar >> tarea_extraer >> tarea_transformar >> tarea_cargar >>tarea_quality_checks >> tarea_actualizar_vm >> tarea_archivar
