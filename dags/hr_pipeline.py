@@ -1,4 +1,4 @@
-from dags.scripts.quality_checks import quality_checks
+from scripts.quality_checks import quality_checks
 from scripts.build_aggregations import refresh_materialized_views
 from scripts.archive import archive_file
 from scripts.config import RUTA_INPUT
