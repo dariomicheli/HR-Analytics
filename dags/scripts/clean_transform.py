@@ -291,11 +291,11 @@ def _etapa_6_validacion_cruzada(q: pl.LazyFrame) -> pl.LazyFrame:
     """ETAPA 6: Validaciones lógicas cruzadas"""
     logger.info("▶️  ETAPA 6: Validación Cruzada")
 
-    # Experience no puede superar age - 16.
+    # Experience no puede superar age - 17.
     # Si age es null la condición evalúa null → se conserva el valor original. ✅
     q = q.with_columns(
         pl.when(pl.col("experience_years") > (pl.col("age") - 16))
-        .then(pl.col("age") - 16)
+        .then(pl.col("age") - 17)
         .otherwise(pl.col("experience_years"))
         .alias("experience_years")
     )
@@ -312,12 +312,20 @@ def _etapa_6_validacion_cruzada(q: pl.LazyFrame) -> pl.LazyFrame:
 
 
 def _etapa_7_imputacion_nulos(q: pl.LazyFrame) -> pl.LazyFrame:
-    """ETAPA 7: Imputación de nulos (previo a etapas 8-11)"""
-    logger.info("▶️  ETAPA 7: Imputación de Nulos Básicos")
+    """
+    ETAPA 7: Imputación de nulos de age y experience_years.
+
+    NOTA: salary ya NO se imputa aquí. El orden correcto es:
+      1. Etapa 9A (eager) → reemplaza salary == 0 por mediana de grupo
+      2. Etapa 9B (eager) → nullifica outliers IQR por grupo
+      3. Etapa 9C (eager) → imputa los nulos resultantes (ceros + outliers + originales)
+    Esto garantiza que la mediana de grupo usada para imputar no esté
+    contaminada ni por ceros ni por outliers.
+    """
+    logger.info("▶️  ETAPA 7: Imputación de Nulos (age · experience_years · categorías)")
 
     q = q.with_columns([
-        pl.col("salary")
-          .fill_null(pl.col("salary").median().over(["job_level", "department"])),
+        # salary: se deja para las etapas eager 9A/9B/9C
         pl.col("age")
           .fill_null(pl.col("age").median().over(["job_level", "department"])),
         pl.col("experience_years")
@@ -326,40 +334,93 @@ def _etapa_7_imputacion_nulos(q: pl.LazyFrame) -> pl.LazyFrame:
         # performance_rating NO recibe centinela aquí; su lógica adaptativa
         # es responsabilidad exclusiva de etapa 10.
     ]).with_columns([
-        # Fallback global para los grupos que no tienen ningún valor válido
-        pl.col("salary").fill_null(pl.col("salary").median()),
+        # Fallback global para grupos sin ningún valor válido
         pl.col("age")
           .fill_null(pl.col("age").median()).round(0).cast(pl.Int32),
         pl.col("experience_years")
           .fill_null(pl.col("experience_years").median()).round(0).cast(pl.Int32),
     ])
 
-    # hire_date: no hay imputación determinística segura; se deja como null
-    # para que etapa 8 la gestione junto con la validación de edad mínima.
+    # hire_date: imputación determinística diferida a etapa 8 (necesita
+    # materialización eager para operar con medianas de grupo por fecha).
 
     return q
 
 def _etapa_8_correccion_edad_minima_laboral(df: pl.DataFrame) -> pl.DataFrame:
     """
-    ETAPA 8: REGLA DE NEGOCIO – Corrección de hire_date por edad mínima laboral.
-    SOLO APLICA A EMPLEADOS ACTIVOS.
-    """
-    logger.info("▶️  ETAPA 8: Corrección por Edad Mínima Laboral (SOLO ACTIVOS)")
+    ETAPA 8: Corrección de hire_date + imputación de nulos de hire_date.
 
-    # Definimos la constante de Python como un literal de Polars de tipo Fecha
+    Sub-etapas:
+      8A. Imputación de hire_date nula usando la mediana del grupo (job_level × department).
+          Fallback: mediana global. Tipo de salida garantizado: pl.Date.
+      8B. Ajuste de hire_date en activos cuya edad_al_contratar < EDAD_MINIMA_LABORAL.
+      8C. Log de fechas sospechosas (< 1950) para auditoría.
+    """
+    logger.info("▶️  ETAPA 8: Imputación hire_date + Corrección Edad Mínima Laboral")
     fecha_dataset_lit = pl.lit(FECHA_DATASET).cast(pl.Date)
 
+    # ── 8A: Imputar hire_date nula ──────────────────────────────────────────
+    nulos_hire = df["hire_date"].null_count()
+    if nulos_hire > 0:
+        logger.warning(f"  ⚠️  8A: {nulos_hire:,} hire_date nulas → imputando por mediana de grupo")
+
+        # Convertimos la fecha a días-desde-epoch (Int32) para poder calcular
+        # medianas numéricas con Polars sin romper el tipo Date.
+        df = df.with_columns(
+            pl.col("hire_date").cast(pl.Int32).alias("_hire_epoch")
+        )
+
+        # Mediana de grupo en días-epoch
+        mediana_grupo_epoch = (
+            df.group_by(["job_level", "department"])
+              .agg(
+                  pl.col("_hire_epoch").drop_nulls().median()
+                    .round(0).cast(pl.Int32).alias("_hire_epoch_grupo")
+              )
+        )
+
+        # Mediana global como fallback
+        mediana_global_epoch = int(
+            df["_hire_epoch"].drop_nulls().median() or 0
+        )
+
+        df = (
+            df.join(mediana_grupo_epoch, on=["job_level", "department"], how="left")
+              .with_columns(
+                  pl.col("_hire_epoch")
+                    .fill_null(pl.col("_hire_epoch_grupo"))
+                    .fill_null(mediana_global_epoch)
+                    .cast(pl.Int32)
+                    .alias("_hire_epoch")
+              )
+              .drop("_hire_epoch_grupo")
+        )
+
+        # Reconstruir columna hire_date desde epoch → pl.Date
+        df = df.with_columns(
+            pl.col("_hire_epoch").cast(pl.Date).alias("hire_date")
+        ).drop("_hire_epoch")
+
+        nulos_post = df["hire_date"].null_count()
+        logger.info(
+            f"  ✅ 8A: hire_date nulas tras imputación: {nulos_post:,} "
+            f"(mediana global epoch={mediana_global_epoch})"
+        )
+    else:
+        logger.info("  ✅ 8A: Sin nulos en hire_date – imputación omitida")
+
+    # ── 8B: Ajuste por edad mínima laboral (solo activos) ──────────────────
     es_activo_con_datos = (
-        (pl.col("status") == "active") &    # normalizado en etapa 3
+        (pl.col("status") == "active") &
         (pl.col("hire_date").is_not_null()) &
         (pl.col("age").is_not_null())
     )
 
-    # 1. Calculamos la edad_al_contratar usando expresiones 100% nativas
     df = df.with_columns(
         pl.when(es_activo_con_datos)
           .then(
-              pl.col("age") - ((fecha_dataset_lit - pl.col("hire_date")).dt.total_days() / 365.25)
+              pl.col("age")
+              - ((fecha_dataset_lit - pl.col("hire_date")).dt.total_days() / 365.25)
           )
           .otherwise(None)
           .alias("edad_al_contratar")
@@ -367,81 +428,199 @@ def _etapa_8_correccion_edad_minima_laboral(df: pl.DataFrame) -> pl.DataFrame:
 
     edad_negativa = df.filter(pl.col("edad_al_contratar") < 0).height
     edad_menor_18 = df.filter(
-        (pl.col("edad_al_contratar") >= 0) & (pl.col("edad_al_contratar") < EDAD_MINIMA_LABORAL)
+        pl.col("edad_al_contratar").is_not_null() &
+        (pl.col("edad_al_contratar") >= 0) &
+        (pl.col("edad_al_contratar") < EDAD_MINIMA_LABORAL)
     ).height
 
     if edad_negativa > 0:
-        logger.warning(f"  ⚠️  {edad_negativa:,} activos con edad_al_contratar < 0 (hire_date futura)")
+        logger.warning(f"  ⚠️  8B: {edad_negativa:,} activos con edad_al_contratar < 0 (hire_date futura)")
 
-    # 2. Ajustamos hire_date si es necesario y aseguramos que mantenga tipo pl.Date
     if edad_menor_18 > 0:
-        logger.warning(f"  ⚠️  {edad_menor_18:,} activos contratados con < 18 años → ajustando hire_date")
-        
+        logger.warning(
+            f"  ⚠️  8B: {edad_menor_18:,} activos contratados con < {EDAD_MINIMA_LABORAL} años "
+            "→ ajustando hire_date"
+        )
         años_faltantes = EDAD_MINIMA_LABORAL - pl.col("edad_al_contratar")
-        
         df = df.with_columns(
             pl.when(
                 pl.col("edad_al_contratar").is_not_null() &
                 (pl.col("edad_al_contratar") < EDAD_MINIMA_LABORAL) &
                 (pl.col("edad_al_contratar") >= 0)
             )
-            .then(pl.col("hire_date") + pl.duration(days=(años_faltantes * 365.25).cast(pl.Int32)))
+            .then(
+                pl.col("hire_date")
+                + pl.duration(days=(años_faltantes * 365.25).cast(pl.Int32))
+            )
             .otherwise(pl.col("hire_date"))
-            .cast(pl.Date)  # <-- ESTO evita que mute a Object/Float si hay nulos remanentes
+            .cast(pl.Date)          # garantiza que no mute a Object
             .alias("hire_date")
         )
+    else:
+        logger.info("  ✅ 8B: Sin hire_dates a corregir por edad mínima")
 
+    # ── 8C: Auditoría de fechas sospechosas ────────────────────────────────
     fecha_sospechosa_count = df.filter(
         (pl.col("status") == "active") &
         (pl.col("hire_date").is_not_null()) &
-        (pl.col("hire_date") < FECHA_SOSPECHOSA)
+        (pl.col("hire_date") < pl.lit(FECHA_SOSPECHOSA).cast(pl.Date))
     ).height
 
     if fecha_sospechosa_count > 0:
-        logger.warning(f"  ⚠️  {fecha_sospechosa_count:,} hire_date ACTIVAS < 1950: revisar origen de datos")
+        logger.warning(
+            f"  ⚠️  8C: {fecha_sospechosa_count:,} hire_date ACTIVAS < {FECHA_SOSPECHOSA} → "
+            "revisar origen de datos"
+        )
+    else:
+        logger.info("  ✅ 8C: Sin hire_date sospechosas")
 
     return df.drop("edad_al_contratar")
 
-def _etapa_9_imputacion_salary_ceros(df: pl.DataFrame) -> pl.DataFrame:
-    """ETAPA 9: REGLA DE NEGOCIO – Imputación de salary == 0 (antes del análisis IQR)"""
-    logger.info("▶️  ETAPA 9: Imputación de Salary == 0")
+def _etapa_9_salary_pipeline(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    ETAPA 9: Pipeline completo de saneamiento de salary en tres sub-etapas ordenadas.
 
+    Orden crítico de negocio:
+      9A. Reemplazar salary == 0 → mediana del grupo (excluyendo ceros y nulos).
+          Esto evita que los ceros contaminen el IQR del paso siguiente.
+      9B. Nullificar outliers IQR por grupo (job_level × department).
+          Los valores fuera de [Q1 - 1.5·IQR, Q3 + 1.5·IQR] pasan a None
+          para ser imputados limpiamente en 9C.
+      9C. Imputar todos los nulos de salary (originales + generados en 9A/9B)
+          usando la mediana del grupo. Fallback: mediana global.
+    """
+    logger.info("▶️  ETAPA 9: Pipeline Salary (9A: ceros → 9B: outliers IQR → 9C: imputación)")
+
+    # ── 9A: Corrección de ceros ────────────────────────────────────────────
     salarios_cero = df.filter(pl.col("salary") == 0).height
 
     if salarios_cero > 0:
-        logger.warning(f"  ⚠️  {salarios_cero:,} salarios == 0 detectados → imputando")
+        logger.warning(f"  ⚠️  9A: {salarios_cero:,} salarios == 0 → imputando por mediana de grupo (excl. ceros)")
 
-        mediana_global = df.filter(pl.col("salary") > 0)["salary"].median()
-        mediana_grupo  = (
-            pl.col("salary").filter(pl.col("salary") > 0)
-            .median().over(["job_level", "department"])
+        mediana_global_no_cero = (
+            df.filter(pl.col("salary") > 0)["salary"].median()
         )
 
-        df = df.with_columns(
-            pl.when(pl.col("salary") == 0)
-              .then(mediana_grupo.fill_null(mediana_global))
-              .otherwise(pl.col("salary"))
-              .alias("salary")
+        mediana_grupo_no_cero = (
+            df.group_by(["job_level", "department"])
+              .agg(
+                  pl.col("salary")
+                    .filter(pl.col("salary") > 0)
+                    .median()
+                    .alias("_sal_med_grupo")
+              )
         )
-        logger.info(f"    → Mediana global (excluyendo ceros): ${mediana_global:,.2f}")
 
-    # Análisis IQR post-imputación (sin collect extra)
-    if len(df) > 0:
+        df = (
+            df.join(mediana_grupo_no_cero, on=["job_level", "department"], how="left")
+              .with_columns(
+                  pl.when(pl.col("salary") == 0)
+                    .then(
+                        pl.col("_sal_med_grupo")
+                          .fill_null(pl.lit(mediana_global_no_cero))
+                    )
+                    .otherwise(pl.col("salary"))
+                    .alias("salary")
+              )
+              .drop("_sal_med_grupo")
+        )
+
+        ceros_post = df.filter(pl.col("salary") == 0).height
+        logger.info(
+            f"  ✅ 9A: ceros restantes: {ceros_post:,} "
+            f"| mediana global de referencia: ${mediana_global_no_cero:,.2f}"
+        )
+    else:
+        logger.info("  ✅ 9A: Sin salarios == 0")
+
+    # ── 9B: Nullificación de outliers IQR por grupo ───────────────────────
+    logger.info("  🔍 9B: Calculando outliers IQR por grupo (job_level × department)")
+
+    stats_grupo = (
+        df.group_by(["job_level", "department"])
+          .agg([
+              pl.col("salary").quantile(0.25).alias("_q1"),
+              pl.col("salary").quantile(0.75).alias("_q3"),
+          ])
+          .with_columns([
+              (pl.col("_q3") - pl.col("_q1")).alias("_iqr"),
+          ])
+          .with_columns([
+              (pl.col("_q1") - 1.5 * pl.col("_iqr")).alias("_lim_inf"),
+              (pl.col("_q3") + 1.5 * pl.col("_iqr")).alias("_lim_sup"),
+          ])
+          .select(["job_level", "department", "_lim_inf", "_lim_sup"])
+    )
+
+    df = df.join(stats_grupo, on=["job_level", "department"], how="left")
+
+    outliers_count = df.filter(
+        pl.col("salary").is_not_null() &
+        (
+            (pl.col("salary") < pl.col("_lim_inf")) |
+            (pl.col("salary") > pl.col("_lim_sup"))
+        )
+    ).height
+
+    df = df.with_columns(
+        pl.when(
+            pl.col("salary").is_not_null() &
+            (
+                (pl.col("salary") < pl.col("_lim_inf")) |
+                (pl.col("salary") > pl.col("_lim_sup"))
+            )
+        )
+        .then(None)          # → pasa a nulo para imputar limpiamente en 9C
+        .otherwise(pl.col("salary"))
+        .alias("salary")
+    ).drop(["_lim_inf", "_lim_sup"])
+
+    pct_out = (outliers_count / len(df)) * 100 if len(df) > 0 else 0.0
+    logger.warning(
+        f"  ⚠️  9B: {outliers_count:,} outliers ({pct_out:.4f}%) nullificados por IQR de grupo"
+    ) if outliers_count > 0 else logger.info("  ✅ 9B: Sin outliers IQR detectados")
+
+    # ── 9C: Imputación final de todos los nulos de salary ─────────────────
+    nulos_salary = df["salary"].null_count()
+    logger.info(f"  🔧 9C: {nulos_salary:,} nulos de salary a imputar (originales + 9A + 9B)")
+
+    if nulos_salary > 0:
+        mediana_global = df.filter(pl.col("salary").is_not_null())["salary"].median()
+
+        mediana_grupo_final = (
+            df.group_by(["job_level", "department"])
+              .agg(
+                  pl.col("salary").drop_nulls().median().alias("_sal_med_final")
+              )
+        )
+
+        df = (
+            df.join(mediana_grupo_final, on=["job_level", "department"], how="left")
+              .with_columns(
+                  pl.col("salary")
+                    .fill_null(pl.col("_sal_med_final"))
+                    .fill_null(pl.lit(mediana_global))
+                    .alias("salary")
+              )
+              .drop("_sal_med_final")
+        )
+
+        nulos_post_9c = df["salary"].null_count()
+        logger.info(
+            f"  ✅ 9C: nulos restantes: {nulos_post_9c:,} "
+            f"| mediana global fallback: ${mediana_global:,.2f}"
+        )
+
+        # Auditoría IQR post-imputación (solo informativa, sin modificar datos)
         q1  = df["salary"].quantile(0.25)
         q3  = df["salary"].quantile(0.75)
         iqr = q3 - q1
-        lim_inf = q1 - 1.5 * iqr
-        lim_sup = q3 + 1.5 * iqr
-
-        outliers = df.filter(
-            (pl.col("salary") < lim_inf) | (pl.col("salary") > lim_sup)
-        ).height
-
-        pct_out = (outliers / len(df)) * 100
         logger.info(
-            f"  Outliers salary (post-imputación): {outliers:,} ({pct_out:.4f}%) "
-            f"| Rango IQR: [${lim_inf:,.0f} – ${lim_sup:,.0f}]"
+            f"  📊 9C post-IQR info: Q1=${q1:,.0f} | Q3=${q3:,.0f} | "
+            f"rango limpio=[${q1 - 1.5*iqr:,.0f} – ${q3 + 1.5*iqr:,.0f}]"
         )
+    else:
+        logger.info("  ✅ 9C: Sin nulos de salary – imputación omitida")
 
     return df
 
@@ -537,6 +716,151 @@ def _etapa_11_normalizacion_final(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def _etapa_12_experience_activos(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    ETAPA 12: Reglas de negocio de experience_years para empleados ACTIVOS.
+
+    Regla A – Corrección de antigüedad real:
+      Si experience_years == 0 O es menor a los años reales transcurridos
+      desde hire_date hasta FECHA_DATASET, se reemplaza por la antigüedad
+      calculada (años_reales). Si el grupo (job_level × department) tiene
+      una mediana mayor aún, se usa esa como piso.
+
+    Regla B – Forzar actualización cuando experience original < años reales:
+      Para cualquier activo donde la experiencia registrada sea inferior a
+      la antigüedad efectiva en la empresa, se fuerza el valor calculado.
+
+    Solo afecta filas con status == 'active'.
+    Empleados inactivos/terminated no se modifican.
+    """
+    logger.info("▶️  ETAPA 12: Corrección de experience_years para Empleados Activos")
+
+    if "hire_date" not in df.columns or "experience_years" not in df.columns:
+        logger.warning("  ⚠️  Columnas hire_date o experience_years ausentes – etapa omitida")
+        return df
+
+    fecha_dataset_lit = pl.lit(FECHA_DATASET).cast(pl.Date)
+
+    # Calcular antigüedad real en años para todos los activos con hire_date válida
+    df = df.with_columns(
+        pl.when(
+            (pl.col("status") == "active") &
+            pl.col("hire_date").is_not_null()
+        )
+        .then(
+            ((fecha_dataset_lit - pl.col("hire_date")).dt.total_days() / 365.25)
+            .round(2)
+        )
+        .otherwise(None)
+        .cast(pl.Float64)
+        .alias("_antiguedad_real")
+    )
+
+    # Mediana de experience_years por grupo para activos (usado como piso de referencia)
+    med_exp_grupo = (
+        df.filter(pl.col("status") == "active")
+          .group_by(["job_level", "department"])
+          .agg(
+              pl.col("experience_years")
+                .drop_nulls()
+                .median()
+                .alias("_med_exp_grupo")
+          )
+    )
+
+    df = df.join(med_exp_grupo, on=["job_level", "department"], how="left")
+
+    # ── Regla A: experience_years == 0 ────────────────────────────────────
+    # Aplicable solo a activos con antigüedad real calculable.
+    cond_regla_a = (
+        (pl.col("status") == "active") &
+        pl.col("_antiguedad_real").is_not_null() &
+        (pl.col("experience_years") == 0)
+    )
+
+    # El valor correcto es el máximo entre la antigüedad real y la mediana del grupo
+    valor_regla_a = (
+        pl.max_horizontal(
+            pl.col("_antiguedad_real"),
+            pl.col("_med_exp_grupo").fill_null(pl.col("_antiguedad_real"))
+        )
+        .round(0)
+        .cast(pl.Int32)
+    )
+
+    n_regla_a = df.filter(cond_regla_a).height
+    if n_regla_a > 0:
+        logger.warning(
+            f"  ⚠️  12A: {n_regla_a:,} activos con experience_years == 0 "
+            "→ corrigiendo con antigüedad real (o mediana de grupo si mayor)"
+        )
+    else:
+        logger.info("  ✅ 12A: Sin activos con experience_years == 0")
+
+    df = df.with_columns(
+        pl.when(cond_regla_a)
+          .then(valor_regla_a)
+          .otherwise(pl.col("experience_years"))
+          .alias("experience_years")
+    )
+
+    # ── Regla B: experience_years < antigüedad real (post-corrección 12A) ─
+    # Si el valor registrado es menor que los años que el empleado lleva
+    # en la empresa, se fuerza la antigüedad real como valor mínimo.
+    cond_regla_b = (
+        (pl.col("status") == "active") &
+        pl.col("_antiguedad_real").is_not_null() &
+        (pl.col("experience_years").cast(pl.Float64) < pl.col("_antiguedad_real"))
+    )
+
+    n_regla_b = df.filter(cond_regla_b).height
+    if n_regla_b > 0:
+        logger.warning(
+            f"  ⚠️  12B: {n_regla_b:,} activos con experience_years < antigüedad real "
+            "→ actualizando al valor de antigüedad"
+        )
+    else:
+        logger.info("  ✅ 12B: Sin activos con experience_years inferior a la antigüedad")
+
+    df = df.with_columns(
+        pl.when(cond_regla_b)
+          .then(pl.col("_antiguedad_real").round(0).cast(pl.Int32))
+          .otherwise(pl.col("experience_years"))
+          .alias("experience_years")
+    )
+
+    # ── Limpieza de columnas auxiliares ───────────────────────────────────
+    df = df.drop(["_antiguedad_real", "_med_exp_grupo"])
+
+    # ── Auditoría post-etapa ───────────────────────────────────────────────
+    total_activos = df.filter(pl.col("status") == "active").height
+    afectados = n_regla_a + n_regla_b
+    logger.info(
+        f"  📊 12 resumen: {afectados:,} / {total_activos:,} activos corregidos "
+        f"(12A={n_regla_a:,}, 12B={n_regla_b:,})"
+    )
+
+    return df
+
+
+
+    """ETAPA 11: Normalización estética final (Title Case)"""
+    logger.info("▶️  ETAPA 11: Normalización Final")
+
+    for col in _COLS_TITLE_CASE:
+        if col in df.columns:
+            df = df.with_columns(pl.col(col).cast(pl.String).str.to_titlecase())
+
+    if "performance_rating" in df.columns:
+        df = df.with_columns(
+            pl.col("performance_rating")
+              .str.replace_all("_", " ")
+              .str.to_titlecase()
+        )
+
+    return df
+
+
 # ===========================================================================
 # FUNCIÓN PRINCIPAL PARA AIRFLOW
 # ===========================================================================
@@ -545,14 +869,23 @@ def clean_data(**context) -> str:
     """
     Pipeline completo de limpieza y transformación de datos HR en Polars.
 
-
+    ORDEN DE ETAPAS
+    ───────────────
+    Lazy  (1-7):  snake_case → PK → tipos → nombres → rangos → validación cruzada
+                  → imputación age/exp (salary diferido a eager)
+    Eager (8-12+):
+      8   hire_date: imputación por mediana de grupo + corrección edad mínima laboral
+      9   salary pipeline: 9A ceros → 9B outliers IQR (→ None) → 9C imputación
+      10  performance_rating adaptativo
+      12  experience_years para activos (Regla A: ceros, Regla B: < antigüedad)
+      11  normalización estética final (Title Case)
     """
 
     t_pipeline = time.perf_counter()
 
     logger.info("╔" + "=" * 68 + "╗")
     logger.info("║" + " PIPELINE: clean_transform ".center(68) + "║")
-    logger.info("║" + " 11 ETAPAS + REGLAS DE NEGOCIO ".center(68)          + "║")
+    logger.info("║" + " 12 ETAPAS + REGLAS DE NEGOCIO ".center(68) + "║")
     logger.info("╚" + "=" * 68 + "╝")
 
     ti = context.get("ti")
@@ -568,13 +901,15 @@ def clean_data(**context) -> str:
 
     # ── Etapas lazy (1-7) ──────────────────────────────────────────────────
     etapas_lazy = [
-        ("Etapa 1 – snake_case",       _etapa_1_limpieza_basica),
-        ("Etapa 2 – PK",               _etapa_2_validacion_pk),
-        ("Etapa 3 – type casting",     _etapa_3_type_casting),
-        ("Etapa 4 – nombres",          _etapa_4_limpieza_nombres),
-        ("Etapa 5 – rangos",           _etapa_5_correccion_rangos),
-        ("Etapa 6 – validación cruzada", _etapa_6_validacion_cruzada),
-        ("Etapa 7 – imputación nulos", _etapa_7_imputacion_nulos),
+        ("Etapa 1  – snake_case",          _etapa_1_limpieza_basica),
+        ("Etapa 2  – PK",                  _etapa_2_validacion_pk),
+        ("Etapa 3  – type casting",        _etapa_3_type_casting),
+        ("Etapa 4  – nombres",             _etapa_4_limpieza_nombres),
+        ("Etapa 5  – rangos",              _etapa_5_correccion_rangos),
+        ("Etapa 6  – validación cruzada",  _etapa_6_validacion_cruzada),
+        # Etapa 7: imputa age + experience_years. salary se deja para etapa 9
+        # (debe pasar primero por corrección de ceros e IQR con datos reales).
+        ("Etapa 7  – imputación age/exp",  _etapa_7_imputacion_nulos),
     ]
     for label, fn in etapas_lazy:
         t0 = time.perf_counter()
@@ -582,7 +917,7 @@ def clean_data(**context) -> str:
         logger.info(f"  ⏱  {label} encolado en {time.perf_counter() - t0:.4f}s")
 
     # ── Materialización ────────────────────────────────────────────────────
-    logger.info("\n⚙️  Materializando datos (etapas 8-11 requieren datos en memoria)…")
+    logger.info("\n⚙️  Materializando datos (etapas 8-12 requieren datos en memoria)…")
     t0 = time.perf_counter()
     df = q.collect()
     n_post_lazy = len(df)
@@ -593,12 +928,20 @@ def clean_data(**context) -> str:
     )
     _auditar_nulos(df, "Post-Etapa 7")
 
-    # ── Etapas eager (8-11) ────────────────────────────────────────────────
+    # ── Etapas eager (8-12+) ───────────────────────────────────────────────
+    # El orden es intencionalmente diferente al número de etapa para respetar
+    # las dependencias de negocio:
+    #   8  → hire_date limpia (la necesita etapa 12 para calcular antigüedad)
+    #   9  → salary saneado (ceros, IQR, imputación)
+    #   10 → performance_rating (independiente)
+    #   12 → experience_years activos (depende de hire_date ya corregida)
+    #   11 → estética final (siempre al último)
     etapas_eager = [
-        ("Etapa 8  – edad mínima laboral",   _etapa_8_correccion_edad_minima_laboral),
-        ("Etapa 9  – salary ceros/IQR",      _etapa_9_imputacion_salary_ceros),
-        ("Etapa 10 – performance_rating",    _etapa_10_performance_rating_adaptativo),
-        ("Etapa 11 – normalización final",   _etapa_11_normalizacion_final),
+        ("Etapa 8  – hire_date + edad mínima",   _etapa_8_correccion_edad_minima_laboral),
+        ("Etapa 9  – salary (ceros→IQR→imputa)", _etapa_9_salary_pipeline),
+        ("Etapa 10 – performance_rating",        _etapa_10_performance_rating_adaptativo),
+        ("Etapa 12 – experience activos",        _etapa_12_experience_activos),
+        ("Etapa 11 – normalización final",       _etapa_11_normalizacion_final),
     ]
     for label, fn in etapas_eager:
         t0     = time.perf_counter()
@@ -615,10 +958,10 @@ def clean_data(**context) -> str:
     logger.info("\n" + "=" * 70)
     logger.info("🎯 REPORTE FINAL DEL PIPELINE")
     logger.info("=" * 70)
-    logger.info(f"  ⏱  Tiempo total pipeline:  {t_total:.2f}s")
-    logger.info(f"  Filas entrada:             {n_original:,}")
-    logger.info(f"  Filas post-lazy (etapas 1-7): {n_post_lazy:,} ({n_post_lazy - n_original:+,})")
-    logger.info(f"  Filas salida final:        {len(df):,} ({len(df) - n_original:+,} total, {(len(df) - n_original) / n_original * 100:+.2f}%)")
+    logger.info(f"  ⏱  Tiempo total pipeline:         {t_total:.2f}s")
+    logger.info(f"  Filas entrada:                    {n_original:,}")
+    logger.info(f"  Filas post-lazy (etapas 1-7):     {n_post_lazy:,} ({n_post_lazy - n_original:+,})")
+    logger.info(f"  Filas salida final:               {len(df):,} ({len(df) - n_original:+,} total, {(len(df) - n_original) / n_original * 100:+.2f}%)")
 
     logger.info("\n  Tipos finales:")
     for col, dtype in zip(df.columns, df.dtypes):
