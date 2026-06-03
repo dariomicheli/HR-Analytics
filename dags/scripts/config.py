@@ -17,6 +17,47 @@ COLUMNAS_STG: list[str] = [
     "salary", "country", "city", "age", "job_level",
 ]
 
+# ================================================
+# Google Drive
+# ================================================
+"""
+Configuración de Google Drive para el sensor y el descubridor.
+
+Requisitos previos en Airflow:
+  1. Instalar: pip install apache-airflow-providers-google
+  2. Crear una conexión tipo "Google Cloud" con id GDRIVE_CONN_ID
+     (Service Account con rol "Viewer" sobre la carpeta de Drive).
+  3. Compartir la carpeta de Drive con el email de la Service Account.
+
+GDRIVE_FOLDER_ID:
+  Abrís la carpeta en el navegador → la URL es:
+  https://drive.google.com/drive/folders/<FOLDER_ID>
+  Copiá ese ID aquí.
+
+GDRIVE_MIME_TYPES_PERMITIDOS:
+  Filtra solo archivos CSV nativos.
+  Si los archivos vienen como Google Sheets exportados usá:
+  "application/vnd.google-apps.spreadsheet"
+"""
+
+# ID de la carpeta de Google Drive provisto por el usuario
+GDRIVE_FOLDER_ID = "1ii1NciG_5E0CLQa6fmYsn83xtMs3RKeV"
+
+# Nombre exacto del Connection Id en la interfaz de Airflow
+GDRIVE_CONN_ID = "google_drive_default"
+
+# Solo queremos CSVs nativos subidos a Drive
+GDRIVE_MIME_TYPES_PERMITIDOS: list[str] = [
+    "text/csv",
+    "text/plain",
+    "application/csv",
+    "application/vnd.ms-excel",        # algunos clientes suben .csv con este MIME
+]
+
+# Cuántos archivos se permiten en la carpeta como máximo (0 = sin límite)
+# Si hay más se loguea un WARNING y se toma el más nuevo.
+GDRIVE_MAX_ARCHIVOS_ESPERADOS: int = 1
+
 
 # ================================================
 # Clean_Transform

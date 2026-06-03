@@ -30,3 +30,6 @@ __pycache__/
 *.log
 logs/*
 !logs/.gitkeep
+
+#Contraseñsa 
+secrets/google_key.json
