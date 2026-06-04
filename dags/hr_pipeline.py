@@ -1,17 +1,15 @@
 from scripts.quality_checks import quality_checks
 from scripts.build_aggregations import refresh_materialized_views
-from scripts.archive import archive_file
+from scripts.cleanup_and_close import finalizar_pipeline
 from scripts.config import RUTA_INPUT
 from scripts.discover import discover_input_file
 from scripts.validate_schema import validate_schema
 from scripts.load import load_data_postgres
 from scripts.clean_transform import clean_data
 from scripts.extract import extract_csv
-from airflow.providers.postgres.operators.postgres import PostgresOperator
 from airflow.operators.python import PythonOperator
 from airflow import DAG
 from datetime import datetime, timedelta
-from airflow.sensors.filesystem import FileSensor
 from scripts.gdrive_sensor import GDriveCSVSensor
 from scripts.config import GDRIVE_CONN_ID, GDRIVE_FOLDER_ID
 # ---------------------------------------------------------------------------
@@ -29,25 +27,23 @@ with DAG(
     dag_id="hr_analytics_pipeline",
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
+    # schedule_interval="*/5 * * * *", # Cada 5 min
     schedule_interval=None,   # Trigger manual o via API externa
     catchup=False,
     max_active_runs=1,
     tags=["etl", "csv", "gdrive"],
 ) as dag:
-
+    """
     # ── 1. SENSOR ─────────────────────────────────────────────────────────
     # Vigila la carpeta de Drive hasta que aparezca al menos un CSV válido.
-    # mode="reschedule": libera el worker mientras espera (más eficiente que poke).
-    # timeout: si en 6 horas no llega ningún archivo, falla la ejecución.
     tarea_esperar = GDriveCSVSensor(
         task_id="esperar_csv_en_drive",
         gdrive_conn_id=GDRIVE_CONN_ID,
         folder_id=GDRIVE_FOLDER_ID,
-        poke_interval=120,           # revisar cada 2 minutos
-        timeout=60*20,        # timeout: 6 horas
+        poke_interval=300,    # revisar cada 5 min
         mode="reschedule",
     )
-
+    """
     # ── 2. DISCOVER ───────────────────────────────────────────────────────
     # Lista los CSVs en Drive, valida cantidad/tamaño, descarga el más nuevo
     # a RUTA_TEMP y publica la ruta local via XCom.
@@ -93,20 +89,19 @@ with DAG(
     )
 
     # ── 8. ARCHIVE ────────────────────────────────────────────────────────
-    # Mueve el CSV descargado desde RUTA_TEMP a RUTA_ARCHIVE con timestamp
-    tarea_archivar = PythonOperator(
-        task_id="archive_file",
-        python_callable=archive_file,
+    # Registra la firma del archivo procesado y limpia los archivos temporales.
+    tarea_cerrar_limpiar = PythonOperator(
+        task_id="finalizar_pipeline",
+        python_callable=finalizar_pipeline,
     )
 
     # ── Orden de ejecución ────────────────────────────────────────────────
     (
-        tarea_esperar
-        >> tarea_descubrir
+        tarea_descubrir
         >> tarea_validar
         >> tarea_extraer
         >> tarea_transformar
         >> tarea_cargar
         >> tarea_actualizar_vm
-        >> tarea_archivar
+        >> tarea_cerrar_limpiar
     )

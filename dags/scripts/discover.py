@@ -15,11 +15,13 @@ Dependencias:
 import logging
 import os
 import io
-from datetime import timezone
+import json
 
 from airflow.providers.google.common.hooks.base_google import GoogleBaseHook
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from airflow.models import Variable
+from airflow.exceptions import AirflowSkipException
 
 from scripts.config import (
     GDRIVE_CONN_ID,
@@ -129,9 +131,8 @@ def _validar_lista(archivos: list[dict]) -> dict:
             "El archivo está vacío o Drive aún no terminó de procesar la subida."
         )
 
-        
-
-    logger.info(f"   Tamaño: {size_bytes / 1_048_576:.2f} MB — dentro del límite.")
+    logger.info(
+        f"   Tamaño: {size_bytes / 1_048_576:.2f} MB — dentro del límite.")
     return elegido
 
 
@@ -145,7 +146,8 @@ def _descargar_archivo(service, archivo: dict) -> str:
 
     request = service.files().get_media(fileId=archivo["id"])
     buffer = io.FileIO(ruta_local, mode="wb")
-    downloader = MediaIoBaseDownload(buffer, request, chunksize=8 * 1024 * 1024)
+    downloader = MediaIoBaseDownload(
+        buffer, request, chunksize=8 * 1024 * 1024)
 
     logger.info(f"⬇️  Descargando '{archivo['name']}' desde Drive...")
     done = False
@@ -169,19 +171,32 @@ def discover_input_file(**context) -> str:
 
     Retorna la ruta local del archivo descargado (via XCom).
     """
-    logger.info(f"🔍 Consultando Google Drive (folder_id={GDRIVE_FOLDER_ID})...")
+    logger.info(
+        f"🔍 Consultando Google Drive (folder_id={GDRIVE_FOLDER_ID})...")
 
     service = _get_drive_service()
-
-    # 1. Listar
     archivos = _listar_csvs(service)
-    logger.info(f"   Archivos CSV encontrados en Drive: {len(archivos)}")
-
-    # 2. Validar y elegir
     elegido = _validar_lista(archivos)
 
-    # 3. Descargar
-    ruta_local = _descargar_archivo(service, elegido)
+    # Recuperamos la última firma procesada (un JSON con id y fecha)
+    firma_guardada_str = Variable.get(
+        "hr_ultima_firma_procesada", default_var="{}")
+    firma_guardada = json.loads(firma_guardada_str)
 
-    # 4. Publicar ruta para las tareas siguientes
+    # Construimos la firma del archivo actual que Drive nos devolvió
+    id_actual = elegido.get("id", "")
+    fecha_actual = elegido.get("modifiedTime", "")
+
+    # Lógica de idempotencia
+    if firma_guardada.get("id") == id_actual and firma_guardada.get("modifiedTime") == fecha_actual:
+        logger.info(
+            f"⚠️  El archivo '{elegido['name']}' ya fue procesado previamente ")
+        raise AirflowSkipException("Archivo ya procesado previamente.")
+
+    # Si es un archivo nuevo (o el mismo pero modificado), pasamos la firma a la última tarea
+    firma_actual = {"id": id_actual, "modifiedTime": fecha_actual}
+    context['ti'].xcom_push(key='firma_drive', value=json.dumps(firma_actual))
+
+    # Continua con la descarga
+    ruta_local = _descargar_archivo(service, elegido)
     return ruta_local
