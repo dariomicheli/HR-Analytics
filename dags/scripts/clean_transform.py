@@ -713,7 +713,7 @@ def _etapa_11_normalizacion_final(df: pl.DataFrame) -> pl.DataFrame:
 
     if "performance_rating" in df.columns:
         df = df.with_columns(
-            pl.col(_COLS_CATEGORICAS_FIJAS)
+            pl.col("performance_rating")
               .str.replace_all("_", " ")
               .str.to_titlecase()
         )
