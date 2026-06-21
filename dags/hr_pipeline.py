@@ -81,6 +81,12 @@ with DAG(
         python_callable=load_data_postgres,
     )
 
+    # Quality Checks post-carga
+    tarea_controles_calidad = PythonOperator(
+        task_id="quality_checks",
+        python_callable=quality_checks,
+    )
+
     # ── 7. REFRESH MATERIALIZED VIEWS ─────────────────────────────────────
     # Actualiza las vistas gold para Metabase
     tarea_actualizar_vm = PythonOperator(
@@ -102,6 +108,7 @@ with DAG(
         >> tarea_extraer
         >> tarea_transformar
         >> tarea_cargar
+        >> tarea_controles_calidad
         >> tarea_actualizar_vm
         >> tarea_cerrar_limpiar
     )

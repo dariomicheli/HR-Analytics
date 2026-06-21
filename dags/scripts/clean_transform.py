@@ -138,17 +138,18 @@ def _etapa_1_limpieza_basica(q: pl.LazyFrame) -> pl.LazyFrame:
 
     return q.rename(nuevos_nombres)
 
-
 def _etapa_2_validacion_pk(q: pl.LazyFrame) -> pl.LazyFrame:
     """ETAPA 2: Validación de Primary Key (employee_id)"""
     logger.info("▶️  ETAPA 2: Validación de Clave Primaria")
     return (
-        q.drop_nulls(subset=["employee_id"])
-         .unique(subset=["employee_id"], keep="first", maintain_order=True)
-
+        q.filter(
+            # 1. Que no sea null nativo
+            pl.col("employee_id").is_not_null() & 
+            # 2. Que no sea un string vacío ni contenga solo espacios
+            (pl.col("employee_id").cast(pl.String).str.strip_chars() != "")
+        )
+        .unique(subset=["employee_id"], keep="first", maintain_order=True)
     )
-
-
 def _etapa_3_type_casting(q: pl.LazyFrame) -> pl.LazyFrame:
     """ETAPA 3: Conversión de tipos de datos + aplicación de STRINGS_NULOS"""
     logger.info("▶️  ETAPA 3: Type Casting")
@@ -182,17 +183,21 @@ def _etapa_3_type_casting(q: pl.LazyFrame) -> pl.LazyFrame:
         )
 
     # Categorías fijas
+    # === REPLACZÁ EL BLOQUE DE CATEGORÍAS FIJAS POR ESTE ===
     cols_cat = [c for c in _COLS_CATEGORICAS_FIJAS if c in schema]
     if cols_cat:
-        base = (
-            pl.col(cols_cat)
-            .cast(pl.String)
-            .str.strip_chars()
-            .str.replace_all(r"\s+", " ")
-            .str.to_lowercase()
-        )
-        exprs.append(base)
-
+        # Generamos una expresión limpia e individual para cada columna conservando su nombre con .alias(c)
+        exprs_categorias = [
+            _nulos_a_null_polars(
+                pl.col(c)
+                .cast(pl.String)
+                .str.strip_chars()
+                .str.replace_all(r"\s+", " ")
+                .str.to_lowercase()
+            ).alias(c) # <-- Esto le fuerza a Polars a mantener el nombre original de cada columna
+            for c in cols_cat
+        ]
+        exprs.extend(exprs_categorias)
 
     if "performance_rating" in schema:
         pr_limpio = (
@@ -692,7 +697,7 @@ def _etapa_10_performance_rating_adaptativo(df: pl.DataFrame) -> pl.DataFrame:
         logger.error(f"    ❌ ≥ 3%: DEMASIADOS NULOS ({pct_nulos:.2f}%)")
         logger.error("    → ACCIÓN REQUERIDA: Revisar proceso de extracción de performance_rating")
         df = df.with_columns(
-            pl.col("performance_rating").fill_null(f"unknown_{VALOR_CENTINELA}")
+            pl.col("performance_rating").fill_null(VALOR_CENTINELA)
         )
 
     return df
@@ -708,10 +713,11 @@ def _etapa_11_normalizacion_final(df: pl.DataFrame) -> pl.DataFrame:
 
     if "performance_rating" in df.columns:
         df = df.with_columns(
-            pl.col("performance_rating")
+            pl.col(_COLS_CATEGORICAS_FIJAS)
               .str.replace_all("_", " ")
               .str.to_titlecase()
         )
+ 
 
     return df
 
@@ -843,24 +849,6 @@ def _etapa_12_experience_activos(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-
-    """ETAPA 11: Normalización estética final (Title Case)"""
-    logger.info("▶️  ETAPA 11: Normalización Final")
-
-    for col in _COLS_TITLE_CASE:
-        if col in df.columns:
-            df = df.with_columns(pl.col(col).cast(pl.String).str.to_titlecase())
-
-    if "performance_rating" in df.columns:
-        df = df.with_columns(
-            pl.col("performance_rating")
-              .str.replace_all("_", " ")
-              .str.to_titlecase()
-        )
-
-    return df
-
-
 # ===========================================================================
 # FUNCIÓN PRINCIPAL PARA AIRFLOW
 # ===========================================================================
@@ -940,8 +928,9 @@ def clean_data(**context) -> str:
         ("Etapa 8  – hire_date + edad mínima",   _etapa_8_correccion_edad_minima_laboral),
         ("Etapa 9  – salary (ceros→IQR→imputa)", _etapa_9_salary_pipeline),
         ("Etapa 10 – performance_rating",        _etapa_10_performance_rating_adaptativo),
-        ("Etapa 12 – experience activos",        _etapa_12_experience_activos),
         ("Etapa 11 – normalización final",       _etapa_11_normalizacion_final),
+        ("Etapa 12 – experience activos",        _etapa_12_experience_activos),
+        
     ]
     for label, fn in etapas_eager:
         t0     = time.perf_counter()
